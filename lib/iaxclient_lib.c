@@ -33,6 +33,7 @@
 #endif
 
 #include "iaxclient_lib.h"
+#include "audio_openal.h" 
 #include "audio_portaudio.h"
 #include "audio_encode.h"
 #ifdef USE_VIDEO

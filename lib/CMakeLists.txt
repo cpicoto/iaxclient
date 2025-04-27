@@ -1,11 +1,36 @@
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.10)
+project(iaxclient C)
 
-include_directories("gsm/inc/")
-include_directories("libiax2/src/")
-include_directories("libspeex/include/")
-include_directories("portmixer/px_common/")
-set(ENABLE_SPEEX 1)
+#
+# Build flags
+#
+add_definitions(-DBUILDING_DLL           # export symbols in DLL
+                -DLIBIAX                 # IAX interior defs
+                -DCODEC_GSM              # enable the G.SM codec
+                -DHAS_STRING_H           # some older platforms
+                -DHAS_STDLIB_H)
 
+if(APPLE)
+  add_definitions(-DMACOSX)
+endif()
+
+option(ENABLE_SPEEX "Compile with Speex preprocessing & codec support" OFF)
+
+#
+# Include paths
+#
+include_directories(
+  ${PROJECT_SOURCE_DIR}             # for your audio_openal.h, etc.
+  ${PROJECT_SOURCE_DIR}/gsm/inc
+  ${PROJECT_SOURCE_DIR}/libiax2/src
+  ${PROJECT_SOURCE_DIR}/libspeex/include
+  ${PROJECT_SOURCE_DIR}/portmixer/px_common
+  /mingw64/include                  # so <AL/al.h> / <AL/alc.h> resolve
+)
+
+#
+# Source files
+#
 set(IAXCLIENT_BASE_SOURCES
     audio_encode.c
     audio_file.c
@@ -13,134 +38,69 @@ set(IAXCLIENT_BASE_SOURCES
     codec_gsm.c
     codec_ulaw.c
     iaxclient_lib.c
-    audio_openal.c
-    #audio_portaudio.c
+    audio_openal.c        # use OpenAL backend
+    # audio_portaudio.c    # disabled
 )
+
+if(WIN32)
+  list(APPEND IAXCLIENT_BASE_SOURCES winfuncs.c)
+else()
+  list(APPEND IAXCLIENT_BASE_SOURCES unixfuncs.c)
+endif()
+
+if(ENABLE_SPEEX)
+  list(APPEND IAXCLIENT_BASE_SOURCES codec_speex.c)
+endif()
+
+file(GLOB GSM_SOURCES "${PROJECT_SOURCE_DIR}/gsm/src/*.c")
 
 set(LIBIAX2_SOURCES
-    libiax2/src/iax.c
-    libiax2/src/iax2-parser.c
-    libiax2/src/jitterbuf.c
-    libiax2/src/md5.c
+  libiax2/src/iax.c
+  libiax2/src/iax2-parser.c
+  libiax2/src/jitterbuf.c
+  libiax2/src/md5.c
 )
-
-set(GSM_SOURCES
-    gsm/src/add.c
-    gsm/src/code.c
-    gsm/src/debug.c
-    gsm/src/decode.c
-    gsm/src/gsm_create.c
-    gsm/src/gsm_decode.c
-    gsm/src/gsm_destroy.c
-    gsm/src/gsm_encode.c
-    gsm/src/gsm_explode.c
-    gsm/src/gsm_implode.c
-    gsm/src/gsm_option.c
-    gsm/src/gsm_print.c
-    gsm/src/long_term.c
-    gsm/src/lpc.c
-    gsm/src/preprocess.c
-    gsm/src/rpe.c
-    gsm/src/short_term.c
-    gsm/src/table.c
-)
-
-if (WIN32)
-    list(APPEND IAXCLIENT_BASE_SOURCES 
-        winfuncs.c)
-else()
-    list(APPEND IAXCLIENT_BASE_SOURCES 
-        unixfuncs.c)
-endif(WIN32)
-
-if (ENABLE_SPEEX)
-    list(APPEND IAXCLIENT_BASE_SOURCES codec_speex.c)
-
-    if (SYSTEM_SPEEX)
-        set(Speex_FIND_REQUIRED TRUE)
-        set(Speexdsp_FIND_REQUIRED TRUE)
-        find_package(Speex)
-        find_package(Speexdsp)
-    endif(SYSTEM_SPEEX)
-
-    if (SPEEX_FOUND AND SPEEXDSP_FOUND)
-        include_directories(${SPEEX_INCLUDE_DIR} ${SPEEXDSP_INCLUDE_DIR})
-        message(STATUS "Using speex includes at: ${SPEEX_INCLUDE_DIR}")
-        message(STATUS "Using speex libraries: ${SPEEX_LIBRARIES}")
-        message(STATUS "Using speex extended library includes at: ${SPEEXDSP_INCLUDE_DIR}")
-        message(STATUS "Using speex extended library libraries: ${SPEEXDSP_LIBRARIES}")
-    else(SPEEX_FOUND AND SPEEXDSP_FOUND)
-        set(SPEEX_SOURCES
-            libspeex/bits.c
-            libspeex/cb_search.c
-            libspeex/exc_10_16_table.c
-            libspeex/exc_10_32_table.c
-            libspeex/exc_20_32_table.c
-            libspeex/exc_5_256_table.c
-            libspeex/exc_5_64_table.c
-            libspeex/exc_8_128_table.c
-            libspeex/filters.c
-            libspeex/gain_table.c
-            libspeex/gain_table_lbr.c
-            libspeex/hexc_10_32_table.c
-            libspeex/hexc_table.c
-            libspeex/high_lsp_tables.c
-            libspeex/jitter.c
-            libspeex/lbr_48k_tables.c
-            libspeex/lpc.c
-            libspeex/lsp.c
-            libspeex/lsp_tables_nb.c
-            libspeex/ltp.c
-            libspeex/math_approx.c
-            libspeex/mdf.c
-            libspeex/medfilter.c
-            libspeex/misc.c
-            libspeex/modes.c
-            libspeex/nb_celp.c
-            libspeex/preprocess.c
-            libspeex/quant_lsp.c
-            libspeex/sb_celp.c
-            libspeex/smallft.c
-            libspeex/speex.c
-            libspeex/speex_callbacks.c
-            libspeex/speex_header.c
-            libspeex/stereo.c
-            libspeex/vbr.c
-            libspeex/vq.c
-            )
-
-        include_directories(${PROJECT_SOURCE_DIR}/3rdparty/iaxclient/lib/libspeex/include)
-    endif(SPEEX_FOUND AND SPEEXDSP_FOUND)
-endif(ENABLE_SPEEX)
-
-if (APPLE)
-    add_definitions(-DMACOSX)
-endif(APPLE)
 
 list(APPEND IAXCLIENT_BASE_SOURCES spandsp/plc.c)
 
-add_definitions(-DLIBIAX)
-
-# for GSM
-add_definitions(-DHAS_STRING_H -DHAS_STDLIB_H)
-add_definitions(-DCODEC_GSM)
-
-
-include_directories(${PROJECT_SOURCE_DIR})
-include_directories(${PROJECT_SOURCE_DIR}/libiax2/src)
-include_directories(${PROJECT_SOURCE_DIR}/gsm/inc)
-
-
+#
+# Build the DLL
+#
 add_library(iaxclient_lib SHARED
-    ${IAXCLIENT_BASE_SOURCES} 
-    ${GSM_SOURCES} 
-    ${SPEEX_SOURCES}
-    ${LIBIAX2_SOURCES})
+  ${IAXCLIENT_BASE_SOURCES}
+  ${GSM_SOURCES}
+  ${LIBIAX2_SOURCES}
+)
 
-if (WIN32)
-    target_link_libraries(iaxclient_lib ${CMAKE_THREAD_LIBS_INIT}
-    ${SPEEX_LIBRARIES} ${SPEEXDSP_LIBRARIES} ${GSM_LIBRARIES} Ws2_32 OpenAl32)
+find_package(Threads REQUIRED)
+
+#
+# Locate Speex libs if requested
+#
+if(ENABLE_SPEEX)
+  find_library(SPEEX_LIBRARY    speex    HINTS /mingw64/lib)
+  find_library(SPEEXDSP_LIBRARY speexdsp HINTS /mingw64/lib)
+  if(NOT SPEEX_LIBRARY OR NOT SPEEXDSP_LIBRARY)
+    message(FATAL_ERROR "ENABLE_SPEEX=ON but libspeex or libspeexdsp not found! Install the MSYS2 speex and speexdsp packages.")
+  endif()
+endif()
+
+#
+# Link libraries
+#
+if(WIN32)
+  target_link_libraries(iaxclient_lib
+    ${CMAKE_THREAD_LIBS_INIT}
+    Ws2_32
+    OpenAL32
+    $<$<BOOL:${ENABLE_SPEEX}>:${SPEEXDSP_LIBRARY}>
+    $<$<BOOL:${ENABLE_SPEEX}>:${SPEEX_LIBRARY}>
+  )
 else()
-    target_link_libraries(iaxclient_lib ${CMAKE_THREAD_LIBS_INIT}
-        ${SPEEX_LIBRARIES} ${SPEEXDSP_LIBRARIES} ${GSM_LIBRARIES} openal) 
-endif(WIN32)
+  target_link_libraries(iaxclient_lib
+    ${CMAKE_THREAD_LIBS_INIT}
+    openal
+    $<$<BOOL:${ENABLE_SPEEX}>:speexdsp>
+    $<$<BOOL:${ENABLE_SPEEX}>:speex>
+  )
+endif()
