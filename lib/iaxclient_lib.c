@@ -1116,7 +1116,7 @@ static void handle_video_event(struct iax_event *e, int callNo)
 }
 #endif	/* USE_VIDEO */
 static struct iaxc_registration *iaxc_find_registration_by_session(struct iax_session *session);
-
+static int iax_send_lagrp(struct iax_session *session, unsigned int ts);
 /* ------------------------------------------------------------------ */
 /*  Completely replace your current iaxc_handle_network_event() with  */
 /*  the version below.                                                */
@@ -1273,7 +1273,11 @@ static void iaxc_handle_network_event(struct iax_event *e, int callNo)
         }
         break;
     }
-
+    case IAX_EVENT_LAGRQ:
+        /* Remote sent a keep-alive; answer immediately */
+        OPENAL_LOG("IAX_EVENT_LAGRQ received (callNo=%d) – sending LAGRP", callNo);
+		//iax_send_lagrp(e->session,e->ts);
+        break;
 /* ------------ anything we don’t explicitly recognise ------------ */
     default:
         OPENAL_LOG("Unknown event explicitly received: etype=%d, callNo=%d",
