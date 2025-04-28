@@ -25,6 +25,19 @@
 #include <stdlib.h>
 #endif
 
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <windows.h>
+  #define OPENAL_LOG(fmt, ...)                                                    \
+    do {                                                                           \
+      char _buf[512];                                                              \
+      _snprintf(_buf, sizeof(_buf), "[openal-debug] " fmt "\n", ##__VA_ARGS__);   \
+      OutputDebugStringA(_buf);                                                    \
+    } while(0)
+#else
+  #define OPENAL_LOG(fmt, ...) fprintf(stderr, "[openal-debug] " fmt "\n", ##__VA_ARGS__)
+#endif
+
 /* Win32 has _vsnprintf instead of vsnprintf */
 #if ! HAVE_VSNPRINTF
 # if HAVE__VSNPRINTF
@@ -47,7 +60,7 @@
 #ifdef AUDIO_ALSA
 #include "audio_alsa.h"
 #endif
-
+#define MAX_REGISTRATIONS 1
 #define IAXC_ERROR  IAXC_TEXT_TYPE_ERROR
 #define IAXC_STATUS IAXC_TEXT_TYPE_STATUS
 #define IAXC_NOTICE IAXC_TEXT_TYPE_NOTICE
@@ -218,79 +231,65 @@ static void default_message_callback(const char * message)
 // Post Events back to clients
 void iaxci_post_event(iaxc_event e)
 {
-	if ( e.type == 0 )
-	{
-		iaxci_usermsg(IAXC_ERROR,
-			"Error: something posted to us an invalid event");
-		return;
-	}
+    iaxc_event **tail;
+	//OPENAL_LOG("Explicit debug: Event type %d", e.type);
 
-    e.radioNo = radioNo;
+    if (e.type == IAXC_EVENT_TEXT)
+        OPENAL_LOG("Explicit debug TEXT event: %s", e.ev.text.message);
 
-	if ( MUTEXTRYLOCK(&iaxc_lock) )
-	{
-		iaxc_event **tail;
+    if (e.type == IAXC_EVENT_STATE)
+        OPENAL_LOG("Explicit debug STATE event: call=%d state=%d", e.ev.call.callNo, e.ev.call.state);
 
-		/* We could not obtain the lock. Queue the event. */
-		MUTEXLOCK(&event_queue_lock);
-		tail = &event_queue;
-		e.next = NULL;
-		while ( *tail )
-			tail = &(*tail)->next;
-		*tail = (iaxc_event *)malloc(sizeof(iaxc_event));
-		memcpy(*tail, &e, sizeof(iaxc_event));
-		MUTEXUNLOCK(&event_queue_lock);
-		return;
-	}
+    MUTEXLOCK(&event_queue_lock);
 
-	/* TODO: This is not the best. Since we were able to get the
-	 * lock, we decide that it is okay to go ahead and do the
-	 * callback to the application. This is really nasty because
-	 * it gives the appearance of serialized callbacks, but in
-	 * reality, we could callback an application multiple times
-	 * simultaneously. So, as things stand, an application must
-	 * do some locking in their callback function to make it
-	 * reentrant. Barf. More ideally, iaxclient would guarantee
-	 * serialized callbacks to the application.
-	 */
-	MUTEXUNLOCK(&iaxc_lock);
+    // Allocate a new event for the queue
+    iaxc_event *queued_event = (iaxc_event *)malloc(sizeof(iaxc_event));
+    if (!queued_event)
+    {
+        MUTEXUNLOCK(&event_queue_lock);
+        iaxci_usermsg(IAXC_ERROR, "Memory allocation failure in iaxci_post_event");
+        return;
+    }
 
-	if ( iaxc_event_callback )
-	{
-		int rv;
+    memcpy(queued_event, &e, sizeof(iaxc_event));
+    queued_event->next = NULL;
 
-		rv = iaxc_event_callback(e);
+    // Add to queue tail
+    tail = &event_queue;
+    while (*tail)
+        tail = &(*tail)->next;
+    *tail = queued_event;
 
-		if ( e.type == IAXC_EVENT_VIDEO )
-		{
-			/* We can free the frame data once it is off the
-			 * event queue and has been processed by the client.
-			 */
-			free(e.ev.video.data);
-		}
-		else if ( e.type == IAXC_EVENT_AUDIO )
-		{
-			free(e.ev.audio.data);
-		}
+    MUTEXUNLOCK(&event_queue_lock);
 
-		if ( rv < 0 )
-			default_message_callback(
-				"IAXCLIENT: BIG PROBLEM, event callback returned failure!");
-		// > 0 means processed
-		if ( rv > 0 )
-			return;
+    // Immediately process all queued events here!
+    MUTEXLOCK(&event_queue_lock);
+    while (event_queue)
+    {
+        iaxc_event *cur_event = event_queue;
+        event_queue = event_queue->next;
 
-		// else, fall through to "defaults"
-	}
+        MUTEXUNLOCK(&event_queue_lock);
 
-	switch ( e.type )
-	{
-		case IAXC_EVENT_TEXT:
-			default_message_callback(e.ev.text.message);
-			// others we just ignore too
-			return;
-	}
+        if (iaxc_event_callback)
+        {
+            int rv = iaxc_event_callback(*cur_event);
+
+            if (cur_event->type == IAXC_EVENT_AUDIO)
+                free(cur_event->ev.audio.data);
+            if (cur_event->type == IAXC_EVENT_VIDEO)
+                free(cur_event->ev.video.data);
+
+            if (rv < 0)
+                default_message_callback("Event callback returned failure!");
+        }
+
+        free(cur_event);
+        MUTEXLOCK(&event_queue_lock);
+    }
+    MUTEXUNLOCK(&event_queue_lock);
 }
+
 
 
 void iaxci_usermsg(int type, const char *fmt, ...)
@@ -1116,106 +1115,176 @@ static void handle_video_event(struct iax_event *e, int callNo)
 	}
 }
 #endif	/* USE_VIDEO */
+static struct iaxc_registration *iaxc_find_registration_by_session(struct iax_session *session);
 
+/* ------------------------------------------------------------------ */
+/*  Completely replace your current iaxc_handle_network_event() with  */
+/*  the version below.                                                */
+/* ------------------------------------------------------------------ */
 static void iaxc_handle_network_event(struct iax_event *e, int callNo)
 {
-	if ( callNo < 0 )
-		return;
+    OPENAL_LOG("Network Event received explicitly: etype=%d, callNo=%d",
+               e->etype, callNo);
 
-	iaxc_note_activity(callNo);
+    if (callNo < 0) {
+        OPENAL_LOG("callNo < 0, explicitly skipping event.");
+        return;
+    }
 
-	switch ( e->etype )
-	{
-	case IAX_EVENT_NULL:
-		break;
-	case IAX_EVENT_HANGUP:
-		iaxci_usermsg(IAXC_STATUS, "Call disconnected by remote");
-		// XXX does the session go away now?
-		iaxc_clear_call(callNo);
-		break;
-	case IAX_EVENT_REJECT:
-		iaxci_usermsg(IAXC_STATUS, "Call rejected by remote");
-		iaxc_clear_call(callNo);
-		break;
-	case IAX_EVENT_ACCEPT:
-		calls[callNo].format = e->ies.format & IAXC_AUDIO_FORMAT_MASK;
-		calls[callNo].vformat = e->ies.format & IAXC_VIDEO_FORMAT_MASK;
-#ifdef USE_VIDEO
-		if ( !(e->ies.format & IAXC_VIDEO_FORMAT_MASK) )
-		{
-			iaxci_usermsg(IAXC_NOTICE,
-					"Failed video codec negotiation.");
-		}
-#endif
-		iaxci_usermsg(IAXC_STATUS,"Call %d accepted", callNo);
-		break;
-	case IAX_EVENT_ANSWER:
-		calls[callNo].state &= ~IAXC_CALL_STATE_RINGING;
-		calls[callNo].state |= IAXC_CALL_STATE_COMPLETE;
-		iaxci_do_state_callback(callNo);
-		iaxci_usermsg(IAXC_STATUS,"Call %d answered", callNo);
-		//iaxc_answer_call(callNo);
-		// notify the user?
-		break;
-	case IAX_EVENT_BUSY:
-		calls[callNo].state &= ~IAXC_CALL_STATE_RINGING;
-		calls[callNo].state |= IAXC_CALL_STATE_BUSY;
-		iaxci_do_state_callback(callNo);
-		iaxci_usermsg(IAXC_STATUS, "Call %d busy", callNo);
-		break;
-	case IAX_EVENT_VOICE:
-		handle_audio_event(e, callNo);
-		if ( (calls[callNo].state & IAXC_CALL_STATE_OUTGOING) &&
-		     (calls[callNo].state & IAXC_CALL_STATE_RINGING) )
-		{
-			calls[callNo].state &= ~IAXC_CALL_STATE_RINGING;
-			calls[callNo].state |= IAXC_CALL_STATE_COMPLETE;
-			iaxci_do_state_callback(callNo);
-			iaxci_usermsg(IAXC_STATUS,"Call %d progress",
-				     callNo);
-		}
-		break;
-#ifdef USE_VIDEO
-	case IAX_EVENT_VIDEO:
-		handle_video_event(e, callNo);
-		break;
-#endif
-	case IAX_EVENT_TEXT:
-		handle_text_event(e, callNo);
-		break;
-	case IAX_EVENT_RINGA:
-		calls[callNo].state |= IAXC_CALL_STATE_RINGING;
-		iaxci_do_state_callback(callNo);
-		iaxci_usermsg(IAXC_STATUS,"Call %d ringing", callNo);
-		break;
-	case IAX_EVENT_PONG:
-		generate_netstat_event(callNo);
-		break;
-	case IAX_EVENT_URL:
-		handle_url_event(e, callNo);
-		break;
-	case IAX_EVENT_CNG:
-		/* ignore? */
-		break;
-	case IAX_EVENT_TIMEOUT:
-		iax_hangup(e->session, "Call timed out");
-		iaxci_usermsg(IAXC_STATUS, "Call %d timed out.", callNo);
-		iaxc_clear_call(callNo);
-		break;
-	case IAX_EVENT_TRANSFER:
-		calls[callNo].state |= IAXC_CALL_STATE_TRANSFER;
-		iaxci_do_state_callback(callNo);
-		iaxci_usermsg(IAXC_STATUS,"Call %d transfer released", callNo);
-		break;
-	case IAX_EVENT_DTMF:
-		iaxci_do_dtmf_callback(callNo,e->subclass);
-		iaxci_usermsg(IAXC_STATUS, "DTMF digit %c received", e->subclass);
-        	break;
-	default:
-		iaxci_usermsg(IAXC_STATUS, "Unknown event: %d for call %d", e->etype, callNo);
-		break;
-	}
+    iaxc_note_activity(callNo);
+
+    switch (e->etype)
+    {
+    case IAX_EVENT_NULL:
+        OPENAL_LOG("IAX_EVENT_NULL explicitly received (callNo=%d)", callNo);
+        break;
+
+/* ---------- standard call-state handlers (unchanged) ------------- */
+    case IAX_EVENT_HANGUP:
+        OPENAL_LOG("IAX_EVENT_HANGUP explicitly received (callNo=%d)", callNo);
+        iaxci_usermsg(IAXC_STATUS, "Call disconnected by remote");
+        iaxc_clear_call(callNo);
+        break;
+
+    case IAX_EVENT_REJECT:
+        OPENAL_LOG("IAX_EVENT_REJECT explicitly received (callNo=%d)", callNo);
+        iaxci_usermsg(IAXC_STATUS, "Call rejected by remote");
+        iaxc_clear_call(callNo);
+        break;
+
+    case IAX_EVENT_ACCEPT:
+        OPENAL_LOG("IAX_EVENT_ACCEPT explicitly received (callNo=%d)", callNo);
+        calls[callNo].format  = e->ies.format  & IAXC_AUDIO_FORMAT_MASK;
+        calls[callNo].vformat = e->ies.format  & IAXC_VIDEO_FORMAT_MASK;
+        iaxci_usermsg(IAXC_STATUS, "Call %d accepted (Authentication succeeded)",
+                      callNo);
+        break;
+
+    case IAX_EVENT_ANSWER:
+        OPENAL_LOG("IAX_EVENT_ANSWER explicitly received (callNo=%d)", callNo);
+        calls[callNo].state &= ~IAXC_CALL_STATE_RINGING;
+        calls[callNo].state |=  IAXC_CALL_STATE_COMPLETE;
+        iaxci_do_state_callback(callNo);
+        iaxci_usermsg(IAXC_STATUS, "Call %d answered (Authentication succeeded)",
+                      callNo);
+        break;
+
+    case IAX_EVENT_BUSY:
+        OPENAL_LOG("IAX_EVENT_BUSY explicitly received (callNo=%d)", callNo);
+        calls[callNo].state &= ~IAXC_CALL_STATE_RINGING;
+        calls[callNo].state |=  IAXC_CALL_STATE_BUSY;
+        iaxci_do_state_callback(callNo);
+        iaxci_usermsg(IAXC_STATUS, "Call %d busy", callNo);
+        break;
+
+/* ---------------- audio, text, url etc. -------------------------- */
+    case IAX_EVENT_VOICE:
+        /* don’t spam log – comment out if you need to trace audio */
+        /* OPENAL_LOG("IAX_EVENT_VOICE explicitly received (callNo=%d)", callNo);*/
+        handle_audio_event(e, callNo);
+        if ((calls[callNo].state & IAXC_CALL_STATE_OUTGOING) &&
+            (calls[callNo].state & IAXC_CALL_STATE_RINGING))
+        {
+            calls[callNo].state &= ~IAXC_CALL_STATE_RINGING;
+            calls[callNo].state |=  IAXC_CALL_STATE_COMPLETE;
+            iaxci_do_state_callback(callNo);
+            iaxci_usermsg(IAXC_STATUS, "Call %d progress", callNo);
+        }
+        break;
+
+    /* -----------  FIXED TEXT-EVENT HANDLER  ------------------- */
+    case IAX_EVENT_TEXT:
+    {
+        OPENAL_LOG("IAX_EVENT_TEXT explicitly received (callNo=%d)", callNo);
+
+        if (e->data && e->datalen > 0) {
+            char buf[IAXC_EVENT_BUFSIZ];
+            int len = (e->datalen >= IAXC_EVENT_BUFSIZ)
+                        ? IAXC_EVENT_BUFSIZ - 1
+                        : e->datalen;
+            memcpy(buf, e->data, len);
+            buf[len] = '\0';
+
+            /* pass up as NOTICE so the application can show it */
+            iaxci_usermsg(IAXC_NOTICE, "%s", buf);
+        }
+        break;
+    }
+
+    case IAX_EVENT_RINGA:
+        OPENAL_LOG("IAX_EVENT_RINGA explicitly received (callNo=%d)", callNo);
+        calls[callNo].state |= IAXC_CALL_STATE_RINGING;
+        iaxci_do_state_callback(callNo);
+        iaxci_usermsg(IAXC_STATUS, "Call %d ringing", callNo);
+        break;
+
+    case IAX_EVENT_PONG:
+        OPENAL_LOG("IAX_EVENT_PONG explicitly received (callNo=%d)", callNo);
+        generate_netstat_event(callNo);
+        break;
+
+    case IAX_EVENT_URL:
+        OPENAL_LOG("IAX_EVENT_URL explicitly received (callNo=%d)", callNo);
+        handle_url_event(e, callNo);
+        break;
+
+    case IAX_EVENT_CNG:
+        OPENAL_LOG("IAX_EVENT_CNG explicitly received (callNo=%d)", callNo);
+        break;
+
+    case IAX_EVENT_TIMEOUT:
+        OPENAL_LOG("IAX_EVENT_TIMEOUT explicitly received (callNo=%d)", callNo);
+        iax_hangup(e->session, "Call timed out");
+        iaxci_usermsg(IAXC_STATUS, "Call %d timed out.", callNo);
+        iaxc_clear_call(callNo);
+        break;
+
+    case IAX_EVENT_TRANSFER:
+        OPENAL_LOG("IAX_EVENT_TRANSFER explicitly received (callNo=%d)", callNo);
+        calls[callNo].state |= IAXC_CALL_STATE_TRANSFER;
+        iaxci_do_state_callback(callNo);
+        iaxci_usermsg(IAXC_STATUS, "Call %d transfer released", callNo);
+        break;
+
+    case IAX_EVENT_DTMF:
+        OPENAL_LOG("IAX_EVENT_DTMF explicitly received (callNo=%d, digit=%c)",
+                   callNo, e->subclass);
+        iaxci_do_dtmf_callback(callNo, e->subclass);
+        iaxci_usermsg(IAXC_STATUS, "DTMF digit %c received", e->subclass);
+        break;
+
+/* ----------------  AUTHREQ handler (unchanged) ------------------- */
+    case IAX_EVENT_AUTHRQ:
+    {
+        OPENAL_LOG("IAX_EVENT_AUTHRQ received (callNo=%d)", callNo);
+
+        struct iaxc_registration *reg = registrations;  /* first (and only) one */
+
+        if (!reg) {
+            OPENAL_LOG("ERROR: No registration for AUTHREQ (callNo=%d)", callNo);
+            iax_reject(e->session, "No registration found");
+        } else {
+            OPENAL_LOG("Using registration: user='%s', host='%s'",
+                       reg->user, reg->host);
+            iax_auth_reply(e->session, reg->pass, e->ies.challenge, 2);
+            iaxci_usermsg(IAXC_STATUS,
+                          "AUTH reply sent for call %d using registration '%s'",
+                          callNo, reg->user);
+        }
+        break;
+    }
+
+/* ------------ anything we don’t explicitly recognise ------------ */
+    default:
+        OPENAL_LOG("Unknown event explicitly received: etype=%d, callNo=%d",
+                   e->etype, callNo);
+        iaxci_usermsg(IAXC_STATUS,
+                      "Unknown event: %d for call %d", e->etype, callNo);
+        break;
+    }
 }
+
+
 
 EXPORT int iaxc_unregister( int id )
 {
@@ -1549,22 +1618,35 @@ static struct iaxc_registration *iaxc_find_registration_by_session(
 	return reg;
 }
 
+
 static void iaxc_handle_regreply(struct iax_event *e, struct iaxc_registration *reg)
 {
-	iaxci_do_registration_callback(reg->id, e->etype, e->ies.msgcount);
+    int reply;
+    if (e->etype == IAX_EVENT_REGACK)
+        reply = IAXC_REGISTRATION_REPLY_ACK;  // 18
+    else if (e->etype == IAX_EVENT_REGREJ)
+        reply = IAXC_REGISTRATION_REPLY_REJ;  // 30
+    else
+        reply = -1;
 
-	// XXX I think the session is no longer valid.. at least, that's
-	// what miniphone does, and re-using the session doesn't seem to
-	// work!
-	iax_destroy(reg->session);
-	reg->session = NULL;
+    iaxc_event evt;
+    evt.type = IAXC_EVENT_REGISTRATION;
+    evt.radioNo = 0; // Explicitly zero this out!
+    evt.ev.reg.id = reg->id;
+    evt.ev.reg.reply = reply;
+    evt.ev.reg.msgcount = e->ies.msgcount;
 
-	if ( e->etype == IAX_EVENT_REGREJ )
-	{
-		// we were rejected, so end the registration
-		iaxc_remove_registration_by_id(reg->id);
-	}
+    OPENAL_LOG("REG reply: regID=%d  rawType=%d  mappedReply=%d", reg->id, e->etype, reply);
+
+    iaxci_post_event(evt);
+
+    iax_destroy(reg->session);
+    reg->session = NULL;
+
+    if (reply == IAXC_REGISTRATION_REPLY_REJ)
+        iaxc_remove_registration_by_id(reg->id);
 }
+
 
 /* this is what asterisk does */
 static int iaxc_choose_codec(int formats)
