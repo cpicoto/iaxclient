@@ -138,6 +138,10 @@ typedef int socklen_t;
 #define IAXC_EVENT_VIDCAP_ERROR  12  /*!< Indicates a video capture error occurred */
 #define IAXC_EVENT_VIDCAP_DEVICE 13  /*!< Indicates a possible video capture device insertion/removal */
 
+/* --- AllStar-Link additions ------------------------------------ */
+#define IAXC_EVENT_RADIO_KEY        35
+#define IAXC_EVENT_RADIO_UNKEY      36
+
 #define IAXC_CALL_STATE_FREE     0       /*!< Indicates a call slot is free */
 #define IAXC_CALL_STATE_ACTIVE   (1<<1)  /*!< Indicates a call is active */
 #define IAXC_CALL_STATE_OUTGOING (1<<2)  /*!< Indicates a call is outgoing */

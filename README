@@ -4,13 +4,14 @@ MINGW64
 cd ~/iaxclient/lib/build
 rm -rf CMakeCache.txt CMakeFiles
 
-cmake ..   -G "MSYS Makefiles"   -DENABLE_SPEEX=OFF
+$ rm -f CMakeCache.txt
+
+cpico@YLNRLAK-CPICOTO MINGW64 ~/iaxclient/lib/build
+cmake -G "MinGW Makefiles"       -DCMAKE_BUILD_TYPE=Debug       -DENABLE_SPEEX=ON       -DLIBIAX=ON       -DBUILDING_DLL=ON       ..
 
 
-cmake ..   -G "MSYS Makefiles"   -DENABLE_SPEEX=ON
-
-make -j4
-
+cpico@YLNRLAK-CPICOTO MINGW64 ~/iaxclient/lib/build
+mingw32-make -j
 
 =======================================================================
 BUILDING THE LIBRARY: (tested on Gentoo/Ubuntu/Windows XP/Windows 7)

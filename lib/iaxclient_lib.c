@@ -381,6 +381,19 @@ void iaxci_do_dtmf_callback(int callNo, char digit)
 	iaxci_post_event(e);
 }
 
+void iaxci_do_radio_callback(int ptt)
+{
+	iaxc_event e;
+	if (  ptt==0)
+	{
+		e.type=IAXC_EVENT_RADIO_KEY ;
+	} else
+	{
+		e.type=IAXC_EVENT_RADIO_UNKEY ;
+	}
+	iaxci_post_event(e);
+}
+
 static int iaxc_remove_registration_by_id(int id)
 {
 	struct iaxc_registration *curr, *prev;
@@ -1123,8 +1136,10 @@ static int iax_send_lagrp(struct iax_session *session, unsigned int ts);
 /* ------------------------------------------------------------------ */
 static void iaxc_handle_network_event(struct iax_event *e, int callNo)
 {
+#ifdef NOTQUIET	
     OPENAL_LOG("Network Event received explicitly: etype=%d, callNo=%d",
                e->etype, callNo);
+#endif
 
     if (callNo < 0) {
         OPENAL_LOG("callNo < 0, explicitly skipping event.");
@@ -1273,6 +1288,14 @@ static void iaxc_handle_network_event(struct iax_event *e, int callNo)
         }
         break;
     }
+	case IAXC_EVENT_RADIO_KEY:
+			iaxci_usermsg(IAXC_STATUS, "Radio key pressed");
+			iaxci_do_radio_callback( 1);
+			break;
+    case IAXC_EVENT_RADIO_UNKEY:
+			iaxci_usermsg(IAXC_STATUS, "Radio key released");
+			iaxci_do_radio_callback( 0);
+			break;
     case IAX_EVENT_LAGRQ:
         /* Remote sent a keep-alive; answer immediately */
         OPENAL_LOG("IAX_EVENT_LAGRQ received (callNo=%d) – sending LAGRP", callNo);
@@ -1640,7 +1663,7 @@ static void iaxc_handle_regreply(struct iax_event *e, struct iaxc_registration *
     evt.ev.reg.reply = reply;
     evt.ev.reg.msgcount = e->ies.msgcount;
 
-    OPENAL_LOG("REG reply: regID=%d  rawType=%d  mappedReply=%d", reg->id, e->etype, reply);
+    //OPENAL_LOG("REG reply: regID=%d  rawType=%d  mappedReply=%d", reg->id, e->etype, reply);
 
     iaxci_post_event(evt);
 
