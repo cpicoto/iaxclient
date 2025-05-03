@@ -861,8 +861,44 @@ int openal_initialize(struct iaxc_audio_driver *d, int sample_rate) {
         OPENAL_LOG("Failed to allocate buffer memory");
         return -1;
     }
+
+    // Make sure context is current before generating buffers
+    if (alcMakeContextCurrent(priv->out_ctx) == ALC_FALSE) {
+        OPENAL_LOG("ERROR: Failed to make context current before generating buffers");
+        free(priv->buffers);
+        return -1;
+    }
+
+    // Generate buffers with error checking
     alGenBuffers(priv->num_buffers, priv->buffers);
+    ALenum err = alGetError();
+    if (err != AL_NO_ERROR) {
+        OPENAL_LOG("ERROR: Failed to generate buffers: 0x%X", err);
+        free(priv->buffers);
+        return -1;
+    }
+
+    // Generate source with error checking
     alGenSources(1, &priv->source);
+    err = alGetError();
+    if (err != AL_NO_ERROR) {
+        OPENAL_LOG("ERROR: Failed to generate source: 0x%X", err);
+        // Clean up the buffers we already created
+        alDeleteBuffers(priv->num_buffers, priv->buffers);
+        free(priv->buffers);
+        return -1;
+    }
+
+    // Set initial source properties
+    alSourcef(priv->source, AL_GAIN, 1.0f);  // Default gain
+    err = alGetError();
+    if (err != AL_NO_ERROR) {
+        OPENAL_LOG("WARNING: Could not set source properties: 0x%X", err);
+    }
+
+    // Initialize volume levels
+    priv->input_level = 1.0f;
+    priv->output_level = 1.0f;
     priv->buffers_free = priv->num_buffers;
 
     /* build IAXClient device list */

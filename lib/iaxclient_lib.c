@@ -384,7 +384,7 @@ void iaxci_do_dtmf_callback(int callNo, char digit)
 void iaxci_do_radio_callback(int ptt)
 {
 	iaxc_event e;
-	if (  ptt==0)
+	if (  ptt==1)
 	{
 		e.type=IAXC_EVENT_RADIO_KEY ;
 	} else

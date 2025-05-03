@@ -1,6 +1,8 @@
 2025/4/27 AD7NP (cpicoto@hotmail.com)
 
 MINGW64
+cd ~/
+mkdir build
 cd ~/iaxclient/lib/build
 rm -rf CMakeCache.txt CMakeFiles
 
@@ -8,6 +10,16 @@ $ rm -f CMakeCache.txt
 
 cpico@YLNRLAK-CPICOTO MINGW64 ~/iaxclient/lib/build
 cmake -G "MinGW Makefiles"       -DCMAKE_BUILD_TYPE=Debug       -DENABLE_SPEEX=ON       -DLIBIAX=ON       -DBUILDING_DLL=ON       ..
+
+
+*DEBUG*
+cmake -G "MinGW Makefiles" \
+      -DCMAKE_BUILD_TYPE=Debug \
+      -DENABLE_SPEEX=ON \
+      -DLIBIAX=ON \
+      -DBUILDING_DLL=ON \
+      -DCMAKE_C_FLAGS="-g -O0" \
+      ..
 
 
 cpico@YLNRLAK-CPICOTO MINGW64 ~/iaxclient/lib/build
