@@ -109,26 +109,52 @@ static int openal_error(const char* fn, int err) {
 int openal_input(struct iaxc_audio_driver *d, void *samples, int *nSamples) {
     struct openal_priv_data* priv = d->priv;
     ALCint available;
+    
+    // Check if capture device is valid
+    if (!priv->in_dev) {
+        OPENAL_LOG("ERROR: No capture device available");
+        *nSamples = 0;
+        return -1;
+    }
+    
     alcGetIntegerv(priv->in_dev, ALC_CAPTURE_SAMPLES, sizeof(available), &available);
+    
+    // Log if we're consistently getting zero samples
+    static int zero_count = 0;
+    if (available == 0) {
+        if (++zero_count % 100 == 0) {
+            OPENAL_LOG("WARNING: No samples available for capture (count: %d)", zero_count);
+        }
+    } else {
+        zero_count = 0;
+    }
 
-    int req = (available < *nSamples) ? 0 : *nSamples;
+    int req = (available < *nSamples) ? available : *nSamples;
     if (req > 0) {
         short *sampleBuf = (short*)samples;
         alcCaptureSamples(priv->in_dev, samples, req);
         
+        // Log audio levels periodically to confirm real data is coming in
+        static int level_check = 0;
+        if (++level_check % 100 == 0) {
+            short max_level = 0;
+            for (int i = 0; i < req; i++) {
+                short abs_val = abs(sampleBuf[i]);
+                if (abs_val > max_level) max_level = abs_val;
+            }
+            OPENAL_LOG("Audio input level: %d/32767 (%d%%)", 
+                      max_level, (max_level * 100) / 32767);
+        }
+        
         // Apply input gain instead of silencing
         if (priv->input_level != 1.0f) {
             for (int i = 0; i < req; i++) {
-                sampleBuf[i] = (short)(sampleBuf[i] * priv->input_level);
+                // Apply a stronger boost (5x) if levels are consistently low
+                sampleBuf[i] = (short)(sampleBuf[i] * priv->input_level * 5.0f);
             }
         }
-        
-        // Add debug logging occasionally
-        static int counter = 0;
-        if (++counter % 100 == 0) {
-            OPENAL_LOG("Capturing audio: %d samples", req);
-        }
     }
+    
     *nSamples = req;
     return 0;
 }
@@ -840,16 +866,41 @@ int openal_initialize(struct iaxc_audio_driver *d, int sample_rate) {
 
     /* open default capture */
     priv->selectedCapture = 0;
+    OPENAL_LOG("Attempting to open capture device '%s' with format: MONO16, rate: %d", 
+              priv->captureDevices[0], sample_rate);
+
     priv->in_dev = alcCaptureOpenDevice(
         priv->captureDevices[0],
         sample_rate,
         AL_FORMAT_MONO16,
         sample_rate/2
     );
-    OPENAL_LOG("Opening default capture device '%s' @ %dHz",
-               priv->captureDevices[0], sample_rate);
-    if (!priv->in_dev) return openal_error("alcCaptureOpenDevice", alcGetError(NULL));
+
+    if (!priv->in_dev) {
+        ALCenum err = alcGetError(NULL);
+        OPENAL_LOG("ERROR: Failed to open capture device: 0x%X", err);
+        
+        // Try with different format or sample rate as fallback
+        OPENAL_LOG("Trying fallback: 16kHz sample rate");
+        priv->in_dev = alcCaptureOpenDevice(
+            priv->captureDevices[0],
+            16000,  // Try lower sample rate
+            AL_FORMAT_MONO16,
+            8000    // Half the buffer size
+        );
+        
+        if (!priv->in_dev) {
+            return openal_error("alcCaptureOpenDevice (fallback)", alcGetError(NULL));
+        }
+        
+        // Update internal sample rate if using fallback
+        priv->sample_rate = 16000;
+        OPENAL_LOG("Using fallback sample rate: 16kHz");
+    }
+
+    // Start capturing immediately
     alcCaptureStart(priv->in_dev);
+    OPENAL_LOG("Capture device opened and started: '%s'", priv->captureDevices[0]);
 
     // Store the driver reference globally for sound playback
     current_audio_driver = d;
@@ -1038,4 +1089,63 @@ static int force_audio_restart(struct iaxc_audio_driver *d, int output) {
     return 0;
 }
 #endif
+
+// Test microphone function - call this from your main app when debugging
+int openal_test_microphone(struct iaxc_audio_driver *d, int seconds) {
+    struct openal_priv_data* priv = d->priv;
+    if (!priv->in_dev) {
+        OPENAL_LOG("ERROR: No capture device to test");
+        return -1;
+    }
+    
+    OPENAL_LOG("Testing microphone for %d seconds...", seconds);
+    
+    // Start capture
+    alcCaptureStart(priv->in_dev);
+    
+    // Sample buffer
+    short samples[2000];  // Large enough for typical frame size
+    int max_level = 0;
+    int frame_count = 0;
+    
+    // Capture for specified seconds
+    int total_ms = seconds * 1000;
+    for (int ms = 0; ms < total_ms; ms += 50) {
+        ALCint available;
+        alcGetIntegerv(priv->in_dev, ALC_CAPTURE_SAMPLES, sizeof(available), &available);
+        
+        if (available > 0) {
+            // Get at most 2000 samples
+            int to_read = (available > 2000) ? 2000 : available;
+            
+            // Read samples
+            alcCaptureSamples(priv->in_dev, samples, to_read);
+            frame_count++;
+            
+            // Analyze levels
+            for (int i = 0; i < to_read; i++) {
+                int abs_val = abs(samples[i]);
+                if (abs_val > max_level) max_level = abs_val;
+            }
+            
+            // Log every 10 frames
+            if (frame_count % 10 == 0) {
+                OPENAL_LOG("Frame %d: %d samples, max level: %d (%d%%)", 
+                          frame_count, to_read, max_level, (max_level * 100) / 32767);
+            }
+        }
+        
+        // Sleep a bit
+        iaxc_millisleep(50);
+    }
+    
+    OPENAL_LOG("Mic test complete - detected max level: %d (%d%%)", 
+              max_level, (max_level * 100) / 32767);
+              
+    if (max_level < 500) {
+        OPENAL_LOG("WARNING: Very low audio levels detected. Check microphone.");
+    }
+    
+    return max_level > 0 ? 0 : -1;
+}
 
