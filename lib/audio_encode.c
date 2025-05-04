@@ -37,17 +37,36 @@
  #include <string.h>
  #include <stdlib.h>
 
-#ifdef _WIN32
-  #include <windows.h>
-  #define AUDIO_LOG(fmt, ...)                                                    \
-    do {                                                                           \
-      char _buf[512];                                                              \
-      _snprintf(_buf, sizeof(_buf), "[audio-debug] " fmt "\n", ##__VA_ARGS__);   \
-      OutputDebugStringA(_buf);                                                    \
-      fprintf(stderr, "[audio-debug] " fmt "\n", ##__VA_ARGS__);                  \
-    } while(0)
+ #ifdef _WIN32
+ #include <windows.h>
+ #define AUDIO_LOG(fmt, ...)                                                    \
+   do {                                                                           \
+     char _buf[512];                                                              \
+     char _time_buf[32];                                                          \
+     SYSTEMTIME _st;                                                              \
+     GetLocalTime(&_st);                                                          \
+     snprintf(_time_buf, sizeof(_time_buf), "%02d:%02d:%02d.%03d",                \
+              _st.wHour, _st.wMinute, _st.wSecond, _st.wMilliseconds);            \
+     _snprintf(_buf, sizeof(_buf), "%s:[audio-debug] " fmt "\n",                 \
+              _time_buf, ##__VA_ARGS__);                                          \
+     OutputDebugStringA(_buf);                                                    \
+   } while(0)
 #else
-  #define AUDIO_LOG(fmt, ...) fprintf(stderr, "[audio-debug] " fmt "\n", ##__VA_ARGS__)
+ #include <time.h>
+ #include <sys/time.h>
+ #define OPENAL_LOG(fmt, ...)                                                    \
+   do {                                                                           \
+     struct timeval tv;                                                           \
+     struct tm* tm_info;                                                          \
+     char _time_buf[32];                                                          \
+     gettimeofday(&tv, NULL);                                                     \
+     tm_info = localtime(&tv.tv_sec);                                             \
+     strftime(_time_buf, sizeof(_time_buf), "%H:%M:%S", tm_info);                 \
+     char _ms_buf[8];                                                             \
+     snprintf(_ms_buf, sizeof(_ms_buf), ".%03d", (int)(tv.tv_usec / 1000));       \
+     strcat(_time_buf, _ms_buf);                                                  \
+     fprintf(stderr, "[audio-debug %s] " fmt "\n", _time_buf, ##__VA_ARGS__);    \
+   } while(0)
 #endif
 
 // WAV file format structures

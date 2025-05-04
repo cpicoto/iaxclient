@@ -16,15 +16,36 @@
 #include <stdio.h>
 
 #ifdef _WIN32
+  #include <winsock2.h>
   #include <windows.h>
   #define OPENAL_LOG(fmt, ...)                                                    \
     do {                                                                           \
       char _buf[512];                                                              \
-      _snprintf(_buf, sizeof(_buf), "[openal-debug] " fmt "\n", ##__VA_ARGS__);   \
+      char _time_buf[32];                                                          \
+      SYSTEMTIME _st;                                                              \
+      GetLocalTime(&_st);                                                          \
+      snprintf(_time_buf, sizeof(_time_buf), "%02d:%02d:%02d.%03d",                \
+               _st.wHour, _st.wMinute, _st.wSecond, _st.wMilliseconds);            \
+      _snprintf(_buf, sizeof(_buf), "%s:[openal-debug] " fmt "\n",                 \
+               _time_buf, ##__VA_ARGS__);                                          \
       OutputDebugStringA(_buf);                                                    \
     } while(0)
 #else
-  #define OPENAL_LOG(fmt, ...) fprintf(stderr, "[openal-debug] " fmt "\n", ##__VA_ARGS__)
+  #include <time.h>
+  #include <sys/time.h>
+  #define OPENAL_LOG(fmt, ...)                                                    \
+    do {                                                                           \
+      struct timeval tv;                                                           \
+      struct tm* tm_info;                                                          \
+      char _time_buf[32];                                                          \
+      gettimeofday(&tv, NULL);                                                     \
+      tm_info = localtime(&tv.tv_sec);                                             \
+      strftime(_time_buf, sizeof(_time_buf), "%H:%M:%S", tm_info);                 \
+      char _ms_buf[8];                                                             \
+      snprintf(_ms_buf, sizeof(_ms_buf), ".%03d", (int)(tv.tv_usec / 1000));       \
+      strcat(_time_buf, _ms_buf);                                                  \
+      fprintf(stderr, "[openal-debug %s] " fmt "\n", _time_buf, ##__VA_ARGS__);    \
+    } while(0)
 #endif
 
 struct openal_priv_data {
@@ -268,12 +289,13 @@ int openal_output(struct iaxc_audio_driver *d, void *samples, int nSamples) {
             int now = GetTickCount();  // Windows specific, use appropriate timer elsewhere
             
             alSourcePlay(priv->source);
-            
+#ifdef NOTQUIET            
             // Only log with reasonable frequency
             if (now - last_report > 1000) {  // Once per second max
                 OPENAL_LOG("Source started playing");
                 last_report = now;
             }
+#endif
         }
     }
 

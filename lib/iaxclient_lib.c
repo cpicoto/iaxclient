@@ -31,18 +31,31 @@
   #define OPENAL_LOG(fmt, ...)                                                    \
     do {                                                                           \
       char _buf[512];                                                              \
-      _snprintf(_buf, sizeof(_buf), "[iaxclient-debug] " fmt "\n", ##__VA_ARGS__);   \
+      char _time_buf[32];                                                          \
+      SYSTEMTIME _st;                                                              \
+      GetLocalTime(&_st);                                                          \
+      snprintf(_time_buf, sizeof(_time_buf), "%02d:%02d:%02d.%03d",                \
+               _st.wHour, _st.wMinute, _st.wSecond, _st.wMilliseconds);            \
+      _snprintf(_buf, sizeof(_buf), "%s:[iaxclient-debug] " fmt "\n",                 \
+               _time_buf, ##__VA_ARGS__);                                          \
       OutputDebugStringA(_buf);                                                    \
     } while(0)
 #else
-  #define OPENAL_LOG(fmt, ...) fprintf(stderr, "[openal-debug] " fmt "\n", ##__VA_ARGS__)
-#endif
-
-/* Win32 has _vsnprintf instead of vsnprintf */
-#if ! HAVE_VSNPRINTF
-# if HAVE__VSNPRINTF
-#  define vsnprintf _vsnprintf
-# endif
+  #include <time.h>
+  #include <sys/time.h>
+  #define OPENAL_LOG(fmt, ...)                                                    \
+    do {                                                                           \
+      struct timeval tv;                                                           \
+      struct tm* tm_info;                                                          \
+      char _time_buf[32];                                                          \
+      gettimeofday(&tv, NULL);                                                     \
+      tm_info = localtime(&tv.tv_sec);                                             \
+      strftime(_time_buf, sizeof(_time_buf), "%H:%M:%S", tm_info);                 \
+      char _ms_buf[8];                                                             \
+      snprintf(_ms_buf, sizeof(_ms_buf), ".%03d", (int)(tv.tv_usec / 1000));       \
+      strcat(_time_buf, _ms_buf);                                                  \
+      fprintf(stderr, "[iaxclient-debug %s] " fmt "\n", _time_buf, ##__VA_ARGS__);    \
+    } while(0)
 #endif
 
 #include "iaxclient_lib.h"
@@ -232,6 +245,7 @@ static void default_message_callback(const char * message)
 void iaxci_post_event(iaxc_event e)
 {
     iaxc_event **tail;
+#ifdef NOTQUITE	
 	//OPENAL_LOG("Explicit debug: Event type %d", e.type);
 
     if (e.type == IAXC_EVENT_TEXT)
@@ -239,7 +253,7 @@ void iaxci_post_event(iaxc_event e)
 
     if (e.type == IAXC_EVENT_STATE)
         OPENAL_LOG("Explicit debug STATE event: call=%d state=%d", e.ev.call.callNo, e.ev.call.state);
-
+#endif
     MUTEXLOCK(&event_queue_lock);
 
     // Allocate a new event for the queue
@@ -1210,8 +1224,9 @@ static void iaxc_handle_network_event(struct iax_event *e, int callNo)
     /* -----------  FIXED TEXT-EVENT HANDLER  ------------------- */
     case IAX_EVENT_TEXT:
     {
+#ifdef NOTQUIET			
         OPENAL_LOG("IAX_EVENT_TEXT explicitly received (callNo=%d)", callNo);
-
+#endif
         if (e->data && e->datalen > 0) {
             char buf[IAXC_EVENT_BUFSIZ];
             int len = (e->datalen >= IAXC_EVENT_BUFSIZ)
