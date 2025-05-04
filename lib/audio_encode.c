@@ -14,6 +14,7 @@
  * the GNU Lesser (Library) General Public License.
  */
 
+ #include "iaxclient.h"
  #include "audio_encode.h"
  #include "iaxclient_lib.h"
  #include "libiax2/src/iax-client.h"
@@ -76,6 +77,12 @@ typedef struct {
 static FILE* audio_capture_file = NULL;
 static int audio_samples_written = 0;
 static int audio_capture_sample_rate = 8000; // Default, will be updated
+
+// Add these global variables after the existing ones
+static time_t audio_capture_start_time = 0;
+static int audio_capture_frame_count = 0;
+static int audio_max_sample = 0;
+static int audio_min_sample = 0;
 
 float iaxci_silence_threshold = AUDIO_ENCODE_SILENCE_DB;
 
@@ -183,6 +190,45 @@ static void calculate_level(short *audio, int len, float *level)
 
 static int input_postprocess(void *audio, int len, int rate)
 {
+	static int frame_count = 0;
+    frame_count++;
+
+    // Log frame info
+    AUDIO_LOG("input_postprocess: frame %d, len=%d samples, rate=%d Hz, sizeof(short)=%zu", 
+        frame_count, len, rate, sizeof(short));
+
+    // Print first few samples for inspection
+    short *samples = (short *)audio;
+    int print_count = len > 8 ? 8 : len;
+    AUDIO_LOG("First %d samples: %d %d %d %d %d %d %d %d", print_count,
+        samples[0], samples[1], samples[2], samples[3],
+        samples[4], samples[5], samples[6], samples[7]);
+
+    // Check for stereo pattern
+    if (len >= 8) {
+        int is_stereo = 1;
+        for (int i = 0; i < 8; i += 2) {
+            if (samples[i] == samples[i+1]) {
+                is_stereo = 0; // If L==R, probably mono
+            }
+        }
+        AUDIO_LOG("Stereo pattern detected: %s", is_stereo ? "YES" : "NO");
+    }
+
+    // Improved stereo/mono detection
+    if (len >= 8) {
+        int pairs = len / 2 > 100 ? 100 : len / 2;
+        int equal_count = 0;
+        for (int i = 0; i < pairs * 2; i += 2) {
+            if (samples[i] == samples[i+1]) {
+                equal_count++;
+            }
+        }
+        float ratio = (float)equal_count / pairs;
+        AUDIO_LOG("Stereo/Mono check: %d/%d pairs equal (%.1f%%)", equal_count, pairs, ratio * 100.0f);
+        AUDIO_LOG("Stereo pattern detected: %s", (ratio > 0.9f) ? "NO (mono)" : "YES (stereo)");
+    }
+
 	static float lowest_volume = 1.0f;
 	float volume;
 	int silent = 0;
@@ -209,12 +255,19 @@ static int input_postprocess(void *audio, int len, int rate)
         AUDIO_LOG("Writing audio: len=%d samples, max_value=%d, has_content=%d", 
                   len, max_sample, has_content);
          */       
+        // Add statistics gathering
+        for (int i = 0; i < len; i++) {
+            if (samples[i] > audio_max_sample) audio_max_sample = samples[i];
+            if (samples[i] < audio_min_sample) audio_min_sample = samples[i];
+        }
+        
         // Write raw PCM data
         size_t written = fwrite(audio, sizeof(short), len, audio_capture_file);
         if (written != len) {
             AUDIO_LOG("WARNING: Failed to write all audio data: %zu/%d written", written, len);
         }
         audio_samples_written += len;
+        audio_capture_frame_count++;
         
         // Flush to ensure data is written to disk
         fflush(audio_capture_file);
@@ -352,102 +405,104 @@ EXPORT void iaxc_set_speex_settings(int decode_enhance, float quality,
 int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
 		int format, int samples)
 {
-	unsigned char outbuf[1024];
-	int outsize = 1024;
-	int silent;
-	int insize = samples;
-	static int was_silent_before = 1;  // Track previous silence state
+    unsigned char outbuf[1024];
+    int outsize = 1024;
+    int insize = samples;
+    static int was_silent_before = 0;
+    
+    /* update last input timestamp */
+    timeLastInput = iax_tvnow();
+    
+    // First record all audio regardless of whether it's "silent"
+    if (audio_capture_file) {
+        short *samples_ptr = (short *)data;
+        // Add statistics gathering
+        for (int i = 0; i < insize; i++) {
+            if (samples_ptr[i] > audio_max_sample) audio_max_sample = samples_ptr[i];
+            if (samples_ptr[i] < audio_min_sample) audio_min_sample = samples_ptr[i];
+        }
+        
+        // Write raw PCM data to file regardless of silence status
+        size_t written = fwrite(data, sizeof(short), insize, audio_capture_file);
+        if (written != insize) {
+            AUDIO_LOG("WARNING: Failed to write all audio data: %zu/%d written", written, insize);
+        }
+        audio_samples_written += insize;
+        audio_capture_frame_count++;
+        fflush(audio_capture_file);
+    }
+    
+    // Now process audio normally for IAX transmission with silence detection
+    int silent = input_postprocess(data, insize, 8000);
+    
+    // Continue with regular IAX silence handling
+    if(silent)
+    {
+        if(!call->tx_silent)
+        {  // send a Comfort Noise Frame
+            call->tx_silent = 1;
+            if ( iaxci_filters & IAXC_FILTER_CN )
+                iax_send_cng(call->session, 10, NULL, 0);
+        }
+        return 0;  // skip encoding silent frames for network
+    }
 
-	/* update last input timestamp */
-	timeLastInput = iax_tvnow();
+    /* we're going to send voice now */
+    call->tx_silent = 0;
+    
+    /* destroy encoder if it is incorrect type */
+    if(call->encoder && call->encoder->format != format)
+    {
+        call->encoder->destroy(call->encoder);
+        call->encoder = NULL;
+    }
 
-	silent = input_postprocess(data, insize, 8000);
-/*
-	AUDIO_LOG("Silence state: %s (was: %s), input_level=%.1f", 
-			silent ? "silent" : "talking",
-			was_silent_before ? "silent" : "talking",
-			input_level);
-*/
-	// Detect state changes for PTT functionality
-	if (silent && !was_silent_before) {
-		// Transition from talking to silent (PTT release)
-		AUDIO_LOG("Detected PTT release (silence transition)");
-		iaxc_ptt_audio_capture_stop();
-		was_silent_before = 1;
-	} else if (!silent && was_silent_before) {
-		// Transition from silent to talking (PTT press)
-		AUDIO_LOG("Detected PTT press (silence transition)");
-		iaxc_ptt_audio_capture_start();
-		was_silent_before = 0;
-	}
+    /* just break early if there's no format defined: this happens for the
+     * first couple of frames of new calls */
+    if(format == 0) return 0;
 
-	if(silent)
-	{
-		if(!call->tx_silent)
-		{  /* send a Comfort Noise Frame */
-			call->tx_silent = 1;
-			if ( iaxci_filters & IAXC_FILTER_CN )
-				iax_send_cng(call->session, 10, NULL, 0);
-		}
-		return 0;  /* poof! no encoding! */
-	}
+    /* create encoder if necessary */
+    if(!call->encoder)
+    {
+        call->encoder = create_codec(format);
+    }
 
-	/* we're going to send voice now */
-	call->tx_silent = 0;
+    if(!call->encoder)
+    {
+        /* ERROR: no codec */
+        fprintf(stderr, "ERROR: Codec could not be created: %d\n", format);
+        return 0;
+    }
 
-	/* destroy encoder if it is incorrect type */
-	if(call->encoder && call->encoder->format != format)
-	{
-		call->encoder->destroy(call->encoder);
-		call->encoder = NULL;
-	}
+    if(call->encoder->encode(call->encoder, &insize, (short *)data,
+                &outsize, outbuf))
+    {
+        /* ERROR: codec error */
+        fprintf(stderr, "ERROR: encode error: %d\n", format);
+        return 0;
+    }
 
-	/* just break early if there's no format defined: this happens for the
-	 * first couple of frames of new calls */
-	if(format == 0) return 0;
+    if(samples-insize == 0)
+    {
+        fprintf(stderr, "ERROR encoding (no samples output (samples=%d)\n", samples);
+        return -1;
+    }
 
-	/* create encoder if necessary */
-	if(!call->encoder)
-	{
-		call->encoder = create_codec(format);
-	}
+    // Send the encoded audio data back to the app if required
+    // TODO: fix the stupid way in which the encoded audio size is returned
+    if ( iaxc_get_audio_prefs() & IAXC_AUDIO_PREF_RECV_LOCAL_ENCODED )
+        iaxci_do_audio_callback(callNo, 0, IAXC_SOURCE_LOCAL, 1,
+                call->encoder->format & IAXC_AUDIO_FORMAT_MASK,
+                sizeof(outbuf) - outsize, outbuf);
 
-	if(!call->encoder)
-	{
-		/* ERROR: no codec */
-		fprintf(stderr, "ERROR: Codec could not be created: %d\n", format);
-		return 0;
-	}
+    if(iax_send_voice(call->session,format, outbuf,
+                sizeof(outbuf) - outsize, samples-insize) == -1)
+    {
+        fprintf(stderr, "Failed to send voice! %s\n", iax_errstr);
+        return -1;
+    }
 
-	if(call->encoder->encode(call->encoder, &insize, (short *)data,
-				&outsize, outbuf))
-	{
-		/* ERROR: codec error */
-		fprintf(stderr, "ERROR: encode error: %d\n", format);
-		return 0;
-	}
-
-	if(samples-insize == 0)
-	{
-		fprintf(stderr, "ERROR encoding (no samples output (samples=%d)\n", samples);
-		return -1;
-	}
-
-	// Send the encoded audio data back to the app if required
-	// TODO: fix the stupid way in which the encoded audio size is returned
-	if ( iaxc_get_audio_prefs() & IAXC_AUDIO_PREF_RECV_LOCAL_ENCODED )
-		iaxci_do_audio_callback(callNo, 0, IAXC_SOURCE_LOCAL, 1,
-				call->encoder->format & IAXC_AUDIO_FORMAT_MASK,
-				sizeof(outbuf) - outsize, outbuf);
-
-	if(iax_send_voice(call->session,format, outbuf,
-				sizeof(outbuf) - outsize, samples-insize) == -1)
-	{
-		fprintf(stderr, "Failed to send voice! %s\n", iax_errstr);
-		return -1;
-	}
-
-	return 0;
+    return 0;
 }
 
 /* decode encoded audio; return the number of bytes decoded
@@ -622,14 +677,19 @@ EXPORT void iaxc_ptt_audio_capture_start(void) {
         AUDIO_LOG("Closed existing audio file before starting new one");
     }
     
+    // Reset statistics
     audio_samples_written = 0;
+    audio_capture_frame_count = 0;
+    audio_max_sample = 0;
+    audio_min_sample = 32767;
+    audio_capture_start_time = time(NULL);
     
     // Create a PTT-specific filename format that includes "ptt" in the name
     char filename[MAX_PATH] = "";
     char exe_path[MAX_PATH] = "";
     char *last_slash = NULL;
     
-    // Get the executable directory path instead of TEMP
+    // Get the executable directory path
     if (GetModuleFileNameA(NULL, exe_path, MAX_PATH) == 0) {
         AUDIO_LOG("ERROR: Failed to get executable path (error=%d)", GetLastError());
         return;
@@ -640,7 +700,6 @@ EXPORT void iaxc_ptt_audio_capture_start(void) {
     if (last_slash != NULL) {
         *(last_slash + 1) = '\0';  // Truncate after the slash to get just the directory
     } else {
-        // No slash found, use current directory
         exe_path[0] = '\0';
     }
     
@@ -667,17 +726,22 @@ EXPORT void iaxc_ptt_audio_capture_start(void) {
         return;
     }
     
+    // Go back to 8000Hz for the WAV file since that's the actual sample rate
+    const int fixed_sample_rate = 8000;  // Standard telephone quality
+    
+    AUDIO_LOG("Creating WAV with sample rate: %d Hz", fixed_sample_rate);
+    
     // Write placeholder WAV header (will be updated when file is closed)
     RiffHeader riff = {{'R','I','F','F'}, 0, {'W','A','V','E'}};
     FmtHeader fmt = {
         {'f','m','t',' '}, 
         16, 
-        1,                         // PCM format
-        1,                         // Mono
-        audio_capture_sample_rate, // Sample rate
-        audio_capture_sample_rate * 2, // Byte rate
-        2,                         // Block align
-        16                         // Bits per sample
+        1,                    // PCM format
+        1,                    // Mono
+        fixed_sample_rate,    // Sample rate - 8000Hz matches OpenAL capture rate
+        fixed_sample_rate * 2, // Byte rate (sample_rate * num_channels * bits_per_sample/8)
+        2,                    // Block align
+        16                    // Bits per sample
     };
     DataHeader data = {{'d','a','t','a'}, 0};
     
@@ -686,19 +750,40 @@ EXPORT void iaxc_ptt_audio_capture_start(void) {
     fwrite(&data, sizeof(data), 1, file);
     
     audio_capture_file = file;
-    AUDIO_LOG("SUCCESS: Started PTT audio capture: %s", filename);
+    AUDIO_LOG("SUCCESS: Started PTT audio capture: %s (8000Hz sample rate)", filename);
 }
 
 // Function to stop recording on PTT release
 EXPORT void iaxc_ptt_audio_capture_stop(void) {
     if (audio_capture_file) {
-        finalize_wav_file(audio_capture_file, audio_samples_written * 2);
-        AUDIO_LOG("PTT audio capture stopped. Wrote %d samples", audio_samples_written);
+        time_t end_time = time(NULL);
+        double wall_clock_duration = difftime(end_time, audio_capture_start_time);
+        double audio_duration = audio_samples_written / 8000.0;
+        int bytes_written = audio_samples_written * 2;
+        double bitrate = (bytes_written * 8) / audio_duration / 1000.0;
+        
+        // Finalize the WAV file
+        finalize_wav_file(audio_capture_file, bytes_written);
+        
+        // Output comprehensive statistics
+        AUDIO_LOG("-------- AUDIO RECORDING STATISTICS --------");
+        AUDIO_LOG("Total samples written: %d samples", audio_samples_written);
+        AUDIO_LOG("Number of frames processed: %d frames", audio_capture_frame_count);
+        AUDIO_LOG("Average frame size: %.1f samples", (float)audio_samples_written / audio_capture_frame_count);
+        AUDIO_LOG("Audio duration: %.2f seconds (at 8000 Hz)", audio_duration);
+        AUDIO_LOG("Wall clock duration: %.2f seconds", wall_clock_duration);
+        AUDIO_LOG("Speed ratio: %.2f (ideal = 1.0)", audio_duration / wall_clock_duration);
+        AUDIO_LOG("File size: %d bytes", bytes_written);
+        AUDIO_LOG("Effective bitrate: %.1f kbps", bitrate);
+        AUDIO_LOG("Dynamic range: min=%d, max=%d (peak=%.1f%%)", 
+                 audio_min_sample, audio_max_sample, 
+                 audio_max_sample * 100.0 / 32767.0);
+        AUDIO_LOG("------------------------------------------");
+        
         audio_capture_file = NULL;
-        audio_samples_written = 0;
-    } else {
-        AUDIO_LOG("PTT audio capture stop called, but no file was open");
     }
+    
+    audio_samples_written = 0;
 }
 
 /* 
