@@ -325,7 +325,7 @@ int openal_select_devices(struct iaxc_audio_driver *d, int input, int output, in
             priv->captureDevices[input],
             priv->sample_rate,
             AL_FORMAT_MONO16,
-            priv->sample_rate / 2
+            priv->sample_rate 
         );
         
         if (!newDev) {
