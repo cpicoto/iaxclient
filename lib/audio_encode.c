@@ -194,40 +194,19 @@ static int input_postprocess(void *audio, int len, int rate)
     frame_count++;
 
     // Log frame info
+    /*
     AUDIO_LOG("input_postprocess: frame %d, len=%d samples, rate=%d Hz, sizeof(short)=%zu", 
         frame_count, len, rate, sizeof(short));
-
+    */
     // Print first few samples for inspection
     short *samples = (short *)audio;
     int print_count = len > 8 ? 8 : len;
+    /*
     AUDIO_LOG("First %d samples: %d %d %d %d %d %d %d %d", print_count,
         samples[0], samples[1], samples[2], samples[3],
         samples[4], samples[5], samples[6], samples[7]);
+    */
 
-    // Check for stereo pattern
-    if (len >= 8) {
-        int is_stereo = 1;
-        for (int i = 0; i < 8; i += 2) {
-            if (samples[i] == samples[i+1]) {
-                is_stereo = 0; // If L==R, probably mono
-            }
-        }
-        AUDIO_LOG("Stereo pattern detected: %s", is_stereo ? "YES" : "NO");
-    }
-
-    // Improved stereo/mono detection
-    if (len >= 8) {
-        int pairs = len / 2 > 100 ? 100 : len / 2;
-        int equal_count = 0;
-        for (int i = 0; i < pairs * 2; i += 2) {
-            if (samples[i] == samples[i+1]) {
-                equal_count++;
-            }
-        }
-        float ratio = (float)equal_count / pairs;
-        AUDIO_LOG("Stereo/Mono check: %d/%d pairs equal (%.1f%%)", equal_count, pairs, ratio * 100.0f);
-        AUDIO_LOG("Stereo pattern detected: %s", (ratio > 0.9f) ? "NO (mono)" : "YES (stereo)");
-    }
 
 	static float lowest_volume = 1.0f;
 	float volume;
@@ -273,10 +252,12 @@ static int input_postprocess(void *audio, int len, int rate)
         fflush(audio_capture_file);
         
         // Periodically log progress
+        /*
         if (audio_samples_written % 8000 == 0) { // Log every second of audio
             AUDIO_LOG("Audio recording progress: %d samples (%.1f seconds)", 
                     audio_samples_written, audio_samples_written/8000.0f);
         }
+        */
 	}
 
 	if ( !st || speex_state_size != len || speex_state_rate != rate )

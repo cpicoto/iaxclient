@@ -142,17 +142,12 @@ int openal_input(struct iaxc_audio_driver *d, void *samples, int *nSamples) {
                 short abs_val = abs(sampleBuf[i]);
                 if (abs_val > max_level) max_level = abs_val;
             }
+            /*
             OPENAL_LOG("Audio input level: %d/32767 (%d%%)", 
                       max_level, (max_level * 100) / 32767);
+                      */
         }
         
-        // Apply input gain instead of silencing
-        if (priv->input_level != 1.0f) {
-            for (int i = 0; i < req; i++) {
-                // Apply a stronger boost (5x) if levels are consistently low
-                sampleBuf[i] = (short)(sampleBuf[i] * priv->input_level * 5.0f);
-            }
-        }
     }
     
     *nSamples = req;
@@ -289,10 +284,10 @@ int openal_output(struct iaxc_audio_driver *d, void *samples, int nSamples) {
         alGetSourcei(priv->source, AL_SOURCE_STATE, &state);
         alGetSourcei(priv->source, AL_BUFFERS_PROCESSED, &processed);
         alGetSourcei(priv->source, AL_BUFFERS_QUEUED, &queued);
-        
+        /*
         OPENAL_LOG("Audio health: State=%d, Processed=%d, Queued=%d, Free=%d",
                   state, processed, queued, priv->buffers_free);
-        
+        */
         if (state == AL_STOPPED && queued > 0) {
             OPENAL_LOG("Source stopped unexpectedly, restarting");
             alSourcePlay(priv->source);
@@ -563,7 +558,7 @@ static void verify_audio_device(struct openal_priv_data* priv) {
     const ALCchar* devName = NULL;
     if (alcIsExtensionPresent(dev, "ALC_ENUMERATE_ALL_EXT")) {
         devName = alcGetString(dev, ALC_ALL_DEVICES_SPECIFIER);
-        OPENAL_LOG("Currently using device: %s", devName ? devName : "unknown");
+        //OPENAL_LOG("Currently using device: %s", devName ? devName : "unknown");
     }
 }
 
