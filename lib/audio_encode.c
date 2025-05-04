@@ -193,19 +193,11 @@ static int input_postprocess(void *audio, int len, int rate)
 	static int frame_count = 0;
     frame_count++;
 
-    // Log frame info
-    /*
-    AUDIO_LOG("input_postprocess: frame %d, len=%d samples, rate=%d Hz, sizeof(short)=%zu", 
-        frame_count, len, rate, sizeof(short));
-    */
+
     // Print first few samples for inspection
     short *samples = (short *)audio;
     int print_count = len > 8 ? 8 : len;
-    /*
-    AUDIO_LOG("First %d samples: %d %d %d %d %d %d %d %d", print_count,
-        samples[0], samples[1], samples[2], samples[3],
-        samples[4], samples[5], samples[6], samples[7]);
-    */
+
 
 
 	static float lowest_volume = 1.0f;
@@ -229,11 +221,7 @@ static int input_postprocess(void *audio, int len, int rate)
                 if (abs(samples[i]) > max_sample)
                     max_sample = abs(samples[i]);
             }
-        }
-        /*
-        AUDIO_LOG("Writing audio: len=%d samples, max_value=%d, has_content=%d", 
-                  len, max_sample, has_content);
-         */       
+        }  
         // Add statistics gathering
         for (int i = 0; i < len; i++) {
             if (samples[i] > audio_max_sample) audio_max_sample = samples[i];
