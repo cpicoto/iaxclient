@@ -19,7 +19,9 @@ cmake -G "MinGW Makefiles" \
       -DLIBIAX=ON \
       -DBUILDING_DLL=ON \
       -DCMAKE_C_FLAGS="-g -O0" \
+      -DSAVE_LOCAL
       ..
+
 
 
 cpico@YLNRLAK-CPICOTO MINGW64 ~/iaxclient/lib/build

@@ -1,0 +1,24 @@
+.c
+#include "audio_encode.h"
+#include "iaxclient_lib.h"
+#include "libiax2/src/iax-client.h"
+#ifdef CODEC_GSM
+#include "codec_gsm.h"
+#endif
+#include "codec_ulaw.h"
+#include "codec_alaw.h"
+
+#include "codec_speex.h"
+#include <speex/speex_preprocess.h>
+
+#ifdef CODEC_ILBC
+#include "codec_ilbc.h"
+#endif
+
+// Add headers for file I/O and time handling
+#include <stdio.h>
+#include <time.h>
+#include <string.h>
+#include <stdlib.h>
+
+// ...existing code...

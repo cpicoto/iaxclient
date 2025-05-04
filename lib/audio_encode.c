@@ -14,21 +14,68 @@
  * the GNU Lesser (Library) General Public License.
  */
 
-#include "audio_encode.h"
-#include "iaxclient_lib.h"
-#include "libiax2/src/iax-client.h"
-#ifdef CODEC_GSM
-#include "codec_gsm.h"
-#endif
-#include "codec_ulaw.h"
-#include "codec_alaw.h"
+ #include "audio_encode.h"
+ #include "iaxclient_lib.h"
+ #include "libiax2/src/iax-client.h"
+ #ifdef CODEC_GSM
+ #include "codec_gsm.h"
+ #endif
+ #include "codec_ulaw.h"
+ #include "codec_alaw.h"
+ 
+ #include "codec_speex.h"
+ #include <speex/speex_preprocess.h>
+ 
+ #ifdef CODEC_ILBC
+ #include "codec_ilbc.h"
+ #endif
+ 
+ // Add headers for file I/O and time handling
+ #include <stdio.h>
+ #include <time.h>
+ #include <string.h>
+ #include <stdlib.h>
 
-#include "codec_speex.h"
-#include <speex/speex_preprocess.h>
-
-#ifdef CODEC_ILBC
-#include "codec_ilbc.h"
+#ifdef _WIN32
+  #include <windows.h>
+  #define AUDIO_LOG(fmt, ...)                                                    \
+    do {                                                                           \
+      char _buf[512];                                                              \
+      _snprintf(_buf, sizeof(_buf), "[audio-debug] " fmt "\n", ##__VA_ARGS__);   \
+      OutputDebugStringA(_buf);                                                    \
+      fprintf(stderr, "[audio-debug] " fmt "\n", ##__VA_ARGS__);                  \
+    } while(0)
+#else
+  #define AUDIO_LOG(fmt, ...) fprintf(stderr, "[audio-debug] " fmt "\n", ##__VA_ARGS__)
 #endif
+
+// WAV file format structures
+typedef struct {
+    char     chunk_id[4];
+    uint32_t chunk_size;
+    char     format[4];
+} RiffHeader;
+
+typedef struct {
+    char     chunk_id[4];
+    uint32_t chunk_size;
+    uint16_t audio_format;
+    uint16_t num_channels;
+    uint32_t sample_rate;
+    uint32_t byte_rate;
+    uint16_t block_align;
+    uint16_t bits_per_sample;
+} FmtHeader;
+
+typedef struct {
+    char     chunk_id[4];
+    uint32_t chunk_size;
+} DataHeader;
+
+// Global file handle for audio capture
+static FILE* audio_capture_file = NULL;
+static int audio_samples_written = 0;
+static int audio_capture_sample_rate = 8000; // Default, will be updated
 
 float iaxci_silence_threshold = AUDIO_ENCODE_SILENCE_DB;
 
@@ -139,6 +186,45 @@ static int input_postprocess(void *audio, int len, int rate)
 	static float lowest_volume = 1.0f;
 	float volume;
 	int silent = 0;
+
+	// Update the sample rate for WAV file creation
+	audio_capture_sample_rate = rate;
+	
+	// Save audio to WAV file if capture is active
+	if (audio_capture_file) {
+		 // Add debug to check if audio data has content
+        short *samples = (short *)audio;
+        int has_content = 0;
+        int max_sample = 0;
+        
+        // Check first few samples to see if there's any audio
+        for (int i = 0; i < 20 && i < len; i++) {
+            if (abs(samples[i]) > 100) { // Threshold for "non-silence"
+                has_content = 1;
+                if (abs(samples[i]) > max_sample)
+                    max_sample = abs(samples[i]);
+            }
+        }
+        /*
+        AUDIO_LOG("Writing audio: len=%d samples, max_value=%d, has_content=%d", 
+                  len, max_sample, has_content);
+         */       
+        // Write raw PCM data
+        size_t written = fwrite(audio, sizeof(short), len, audio_capture_file);
+        if (written != len) {
+            AUDIO_LOG("WARNING: Failed to write all audio data: %zu/%d written", written, len);
+        }
+        audio_samples_written += len;
+        
+        // Flush to ensure data is written to disk
+        fflush(audio_capture_file);
+        
+        // Periodically log progress
+        if (audio_samples_written % 8000 == 0) { // Log every second of audio
+            AUDIO_LOG("Audio recording progress: %d samples (%.1f seconds)", 
+                    audio_samples_written, audio_samples_written/8000.0f);
+        }
+	}
 
 	if ( !st || speex_state_size != len || speex_state_rate != rate )
 	{
@@ -270,11 +356,30 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
 	int outsize = 1024;
 	int silent;
 	int insize = samples;
+	static int was_silent_before = 1;  // Track previous silence state
 
 	/* update last input timestamp */
 	timeLastInput = iax_tvnow();
 
 	silent = input_postprocess(data, insize, 8000);
+/*
+	AUDIO_LOG("Silence state: %s (was: %s), input_level=%.1f", 
+			silent ? "silent" : "talking",
+			was_silent_before ? "silent" : "talking",
+			input_level);
+*/
+	// Detect state changes for PTT functionality
+	if (silent && !was_silent_before) {
+		// Transition from talking to silent (PTT release)
+		AUDIO_LOG("Detected PTT release (silence transition)");
+		iaxc_ptt_audio_capture_stop();
+		was_silent_before = 1;
+	} else if (!silent && was_silent_before) {
+		// Transition from silent to talking (PTT press)
+		AUDIO_LOG("Detected PTT press (silence transition)");
+		iaxc_ptt_audio_capture_start();
+		was_silent_before = 0;
+	}
 
 	if(silent)
 	{
@@ -410,5 +515,205 @@ EXPORT void iaxc_set_silence_threshold(float thr)
 {
 	iaxci_silence_threshold = thr;
 	set_speex_filters();
+}
+
+// Update create_wav_file
+
+static FILE* create_wav_file(int sample_rate) {
+    char filename[256];
+    time_t now;
+    struct tm *timeinfo;
+    char current_dir[MAX_PATH];
+    
+    // Get current working directory for diagnostics
+    if (GetCurrentDirectoryA(MAX_PATH, current_dir)) {
+        AUDIO_LOG("Current working directory: %s", current_dir);
+    }
+    
+    time(&now);
+    timeinfo = localtime(&now);
+    
+    // Format: audio_capture_YYYYMMDD_HHMMSS.wav
+    strftime(filename, sizeof(filename), "audio_capture_%Y%m%d_%H%M%S.wav", timeinfo);
+    
+    AUDIO_LOG("Attempting to create file: %s", filename);
+    FILE* file = fopen(filename, "wb");
+    if (!file) {
+        AUDIO_LOG("ERROR: Failed to create audio capture file: %s (errno=%d: %s)", 
+                filename, errno, strerror(errno));
+        return NULL;
+    }
+    
+    // Write placeholder WAV header (will be updated when file is closed)
+    RiffHeader riff = {{'R','I','F','F'}, 0, {'W','A','V','E'}};
+    FmtHeader fmt = {
+        {'f','m','t',' '}, 
+        16, 
+        1,                         // PCM format
+        1,                         // Mono
+        sample_rate,               // Sample rate
+        sample_rate * 2,           // Byte rate (sample_rate * num_channels * bits_per_sample/8)
+        2,                         // Block align (num_channels * bits_per_sample/8)
+        16                         // Bits per sample
+    };
+    DataHeader data = {{'d','a','t','a'}, 0};
+    
+    fwrite(&riff, sizeof(riff), 1, file);
+    fwrite(&fmt, sizeof(fmt), 1, file);
+    fwrite(&data, sizeof(data), 1, file);
+    
+    AUDIO_LOG("Successfully created audio capture file: %s", filename);
+    return file;
+}
+
+// Finalize WAV file by writing correct header sizes
+static void finalize_wav_file(FILE* file, int data_size) {
+    if (!file) return;
+    
+    // Calculate and update sizes in WAV header
+    uint32_t data_chunk_size = data_size;
+    uint32_t riff_chunk_size = 36 + data_chunk_size;
+    
+    AUDIO_LOG("Finalizing WAV file with data_size=%d bytes", data_size);
+    
+    // Update RIFF chunk size
+    fseek(file, 4, SEEK_SET);
+    fwrite(&riff_chunk_size, 4, 1, file);
+    
+    // Update data chunk size
+    fseek(file, 40, SEEK_SET);
+    fwrite(&data_chunk_size, 4, 1, file);
+    
+    // Flush before closing
+    fflush(file);
+    
+    // Close the file
+    fclose(file);
+    AUDIO_LOG("Audio capture completed. Wrote %d bytes of audio data.", data_size);
+}
+
+// Function to start a new audio capture
+EXPORT void iaxc_debug_audio_capture_start(void) {
+    // Close any existing capture file
+    if (audio_capture_file) {
+        finalize_wav_file(audio_capture_file, audio_samples_written * 2);
+        audio_capture_file = NULL;
+    }
+    
+    audio_samples_written = 0;
+    audio_capture_file = create_wav_file(audio_capture_sample_rate);
+}
+
+// Function to stop audio capture
+EXPORT void iaxc_debug_audio_capture_stop(void) {
+    if (audio_capture_file) {
+        finalize_wav_file(audio_capture_file, audio_samples_written * 2);
+        audio_capture_file = NULL;
+        audio_samples_written = 0;
+    }
+}
+
+// Function to start recording on PTT press
+EXPORT void iaxc_ptt_audio_capture_start(void) {
+    // Close any existing capture file
+    if (audio_capture_file) {
+        finalize_wav_file(audio_capture_file, audio_samples_written * 2);
+        audio_capture_file = NULL;
+        AUDIO_LOG("Closed existing audio file before starting new one");
+    }
+    
+    audio_samples_written = 0;
+    
+    // Create a PTT-specific filename format that includes "ptt" in the name
+    char filename[MAX_PATH] = "";
+    char exe_path[MAX_PATH] = "";
+    char *last_slash = NULL;
+    
+    // Get the executable directory path instead of TEMP
+    if (GetModuleFileNameA(NULL, exe_path, MAX_PATH) == 0) {
+        AUDIO_LOG("ERROR: Failed to get executable path (error=%d)", GetLastError());
+        return;
+    }
+    
+    // Find the last backslash to extract just the directory
+    last_slash = strrchr(exe_path, '\\');
+    if (last_slash != NULL) {
+        *(last_slash + 1) = '\0';  // Truncate after the slash to get just the directory
+    } else {
+        // No slash found, use current directory
+        exe_path[0] = '\0';
+    }
+    
+    AUDIO_LOG("Using executable directory: %s", exe_path);
+    
+    time_t now;
+    struct tm *timeinfo;
+    
+    time(&now);
+    timeinfo = localtime(&now);
+    
+    // Format: ptt_audio_YYYYMMDD_HHMMSS.wav in executable directory
+    snprintf(filename, sizeof(filename), "%sptt_audio_%04d%02d%02d_%02d%02d%02d.wav", 
+             exe_path,
+             timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
+             timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+    
+    AUDIO_LOG("ATTEMPTING TO CREATE FILE: %s", filename);
+    
+    FILE* file = fopen(filename, "wb");
+    if (!file) {
+        AUDIO_LOG("ERROR: Failed to create PTT audio capture file: %s (errno=%d: %s)", 
+                 filename, errno, strerror(errno));
+        return;
+    }
+    
+    // Write placeholder WAV header (will be updated when file is closed)
+    RiffHeader riff = {{'R','I','F','F'}, 0, {'W','A','V','E'}};
+    FmtHeader fmt = {
+        {'f','m','t',' '}, 
+        16, 
+        1,                         // PCM format
+        1,                         // Mono
+        audio_capture_sample_rate, // Sample rate
+        audio_capture_sample_rate * 2, // Byte rate
+        2,                         // Block align
+        16                         // Bits per sample
+    };
+    DataHeader data = {{'d','a','t','a'}, 0};
+    
+    fwrite(&riff, sizeof(riff), 1, file);
+    fwrite(&fmt, sizeof(fmt), 1, file);
+    fwrite(&data, sizeof(data), 1, file);
+    
+    audio_capture_file = file;
+    AUDIO_LOG("SUCCESS: Started PTT audio capture: %s", filename);
+}
+
+// Function to stop recording on PTT release
+EXPORT void iaxc_ptt_audio_capture_stop(void) {
+    if (audio_capture_file) {
+        finalize_wav_file(audio_capture_file, audio_samples_written * 2);
+        AUDIO_LOG("PTT audio capture stopped. Wrote %d samples", audio_samples_written);
+        audio_capture_file = NULL;
+        audio_samples_written = 0;
+    } else {
+        AUDIO_LOG("PTT audio capture stop called, but no file was open");
+    }
+}
+
+/* 
+ * Handle PTT events triggered by text messages
+ * This should be called from the IAX text message handler
+ */
+EXPORT void iaxc_handle_audio_event(const char* message) {
+    if (!message) return;
+    
+    if (strcmp(message, "Radio key pressed") == 0) {
+        iaxc_ptt_audio_capture_start();
+        fprintf(stderr, "Started audio recording on PTT press\n");
+    } else if (strcmp(message, "Radio key released") == 0) {
+        iaxc_ptt_audio_capture_stop();
+        fprintf(stderr, "Stopped audio recording on PTT release\n");
+    }
 }
 

@@ -31,7 +31,7 @@
   #define OPENAL_LOG(fmt, ...)                                                    \
     do {                                                                           \
       char _buf[512];                                                              \
-      _snprintf(_buf, sizeof(_buf), "[openal-debug] " fmt "\n", ##__VA_ARGS__);   \
+      _snprintf(_buf, sizeof(_buf), "[iaxclient-debug] " fmt "\n", ##__VA_ARGS__);   \
       OutputDebugStringA(_buf);                                                    \
     } while(0)
 #else
@@ -2070,6 +2070,8 @@ EXPORT void iaxc_key_radio(int callNo)
 		return;
 
 	iax_key_radio(calls[callNo].session);
+	OPENAL_LOG("Starting audio recording due to radio key");
+	iaxc_ptt_audio_capture_start();
 }
 
 EXPORT void iaxc_unkey_radio(int callNo)
@@ -2078,6 +2080,8 @@ EXPORT void iaxc_unkey_radio(int callNo)
 		return;
 
 	iax_unkey_radio(calls[callNo].session);
+	OPENAL_LOG("Stopping audio recording due to radio unkey");
+    iaxc_ptt_audio_capture_stop();
 }
 
 EXPORT void iaxc_set_radiono(int r)
