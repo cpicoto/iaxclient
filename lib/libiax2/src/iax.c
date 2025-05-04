@@ -32,6 +32,41 @@
 #include <stdio.h>
 #include <limits.h>
 
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <windows.h>
+  #include <ws2tcpip.h>
+  #define IAX_LOG(fmt, ...)                                                    \
+    do {                                                                           \
+      char _buf[512];                                                              \
+      char _time_buf[32];                                                          \
+      SYSTEMTIME _st;                                                              \
+      GetLocalTime(&_st);                                                          \
+      snprintf(_time_buf, sizeof(_time_buf), "%02d:%02d:%02d.%03d",                \
+               _st.wHour, _st.wMinute, _st.wSecond, _st.wMilliseconds);            \
+      _snprintf(_buf, sizeof(_buf), "%s:[iax-debug] " fmt "\n",                 \
+               _time_buf, ##__VA_ARGS__);                                          \
+      OutputDebugStringA(_buf);                                                    \
+    } while(0)
+#else
+  #include <time.h>
+  #include <sys/time.h>
+  #define OPENAL_LOG(fmt, ...)                                                    \
+    do {                                                                           \
+      struct timeval tv;                                                           \
+      struct tm* tm_info;                                                          \
+      char _time_buf[32];                                                          \
+      gettimeofday(&tv, NULL);                                                     \
+      tm_info = localtime(&tv.tv_sec);                                             \
+      strftime(_time_buf, sizeof(_time_buf), "%H:%M:%S", tm_info);                 \
+      char _ms_buf[8];                                                             \
+      snprintf(_ms_buf, sizeof(_ms_buf), ".%03d", (int)(tv.tv_usec / 1000));       \
+      strcat(_time_buf, _ms_buf);                                                  \
+      fprintf(stderr, "[openal-debug %s] " fmt "\n", _time_buf, ##__VA_ARGS__);    \
+    } while(0)
+#endif
+
+
 #if !defined(_WIN32_WCE)
 #include <sys/timeb.h>
 #endif
@@ -1764,45 +1799,62 @@ int iax_video_bypass_jitter(struct iax_session *s, int mode)
 
 int iax_register(struct iax_session *session, const char *server, const char *peer, const char *secret, int refresh)
 {
-	/* Send a registration request */
-	char tmp[256];
-	char *p;
-	int res;
-	int portno = IAX_DEFAULT_PORTNO;
-	struct iax_ie_data ied;
-	struct hostent *hp;
+    /* Send a registration request */
+    char tmp[256];
+    char *p;
+    int res;
+    int portno = IAX_DEFAULT_PORTNO;
+    struct iax_ie_data ied;
+    struct hostent *hp;
+    struct sockaddr_in sa;
 
-	tmp[255] = '\0';
-	strncpy(tmp, server, sizeof(tmp) - 1);
-	p = strchr(tmp, ':');
-	if (p) {
-		*p = '\0';
-		portno = atoi(p+1);
-	}
+    tmp[255] = '\0';
+    strncpy(tmp, server, sizeof(tmp) - 1);
+    p = strchr(tmp, ':');
+    if (p) {
+        *p = '\0';
+        portno = atoi(p+1);
+    }
 
-	memset(&ied, 0, sizeof(ied));
-	if (secret)
-		strncpy(session->secret, secret, sizeof(session->secret) - 1);
-	else
-		strcpy(session->secret, "");
+    memset(&ied, 0, sizeof(ied));
+    if (secret)
+        strncpy(session->secret, secret, sizeof(session->secret) - 1);
+    else
+        strcpy(session->secret, "");
 
-	memset(&session->unregreason, 0, sizeof(session->unregreason));
+    memset(&session->unregreason, 0, sizeof(session->unregreason));
 
-	/* Connect first */
-	hp = gethostbyname(tmp);
-	if (!hp) {
-		snprintf(iax_errstr, sizeof(iax_errstr), "Invalid hostname: %s", tmp);
-		return -1;
-	}
-	memcpy(&session->peeraddr.sin_addr, hp->h_addr, sizeof(session->peeraddr.sin_addr));
-	session->peeraddr.sin_port = htons(portno);
-	session->peeraddr.sin_family = AF_INET;
-	strncpy(session->username, peer, sizeof(session->username) - 1);
-	session->refresh = refresh;
-	iax_ie_append_str(&ied, IAX_IE_USERNAME, peer);
-	iax_ie_append_short(&ied, IAX_IE_REFRESH, refresh);
-	res = send_command(session, AST_FRAME_IAX, IAX_COMMAND_REGREQ, 0, ied.buf, ied.pos, -1);
-	return res;
+    /* Check if the hostname is already an IP address before trying DNS */
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    if ((sa.sin_addr.s_addr = inet_addr(tmp)) != INADDR_NONE) {
+#ifdef DEBUG_SUPPORT		
+        IAX_LOG("Already an IP address\n");
+#endif
+    } else {
+        /* Connect through DNS */
+        hp = gethostbyname(tmp);
+        if (!hp) {
+            snprintf(iax_errstr, sizeof(iax_errstr), "Invalid hostname: %s", tmp);
+            IAX_LOG("Invalid hostname: %s\n", tmp);
+            return -1;
+        }
+        memcpy(&sa.sin_addr, hp->h_addr, sizeof(sa.sin_addr));
+    }
+    
+    /* Copy the resolved/parsed address to the session */
+    memcpy(&session->peeraddr.sin_addr, &sa.sin_addr, sizeof(session->peeraddr.sin_addr));
+    session->peeraddr.sin_port = htons(portno);
+    session->peeraddr.sin_family = AF_INET;
+    strncpy(session->username, peer, sizeof(session->username) - 1);
+    session->refresh = refresh;
+    iax_ie_append_str(&ied, IAX_IE_USERNAME, peer);
+    iax_ie_append_short(&ied, IAX_IE_REFRESH, refresh);
+#ifdef DEBUG_SUPPORT	
+    IAX_LOG("iax_register: Sending register request\n");
+#endif
+    res = send_command(session, AST_FRAME_IAX, IAX_COMMAND_REGREQ, 0, ied.buf, ied.pos, -1);
+    return res;
 }
 
 int iax_unregister(struct iax_session *session, const char *server, const char *peer, const char *secret, const char *reason)
