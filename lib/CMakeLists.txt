@@ -90,16 +90,18 @@ if(ENABLE_SPEEX)
   add_definitions(-DHAVE_SPEEX_DSP)
 endif()
 
-#
-# Locate PortAudio library (Locally Built - Installed to /mingw64)
-#
-set(PORTAUDIO_LIBRARY "/mingw64/lib/libportaudio.dll.a" CACHE FILEPATH "Path to locally built PortAudio import library in /mingw64/lib")
+# Find the PortAudio static library
+find_library(PORTAUDIO_LIBRARY
+  NAMES portaudio
+  HINTS "/mingw64/lib"
+  DOC "Path to PortAudio static library"
+)
 
-if(NOT EXISTS "${PORTAUDIO_LIBRARY}")
-  message(FATAL_ERROR "Locally built PortAudio library not found at specified path: ${PORTAUDIO_LIBRARY}. Please ensure it was installed correctly to /mingw64.")
+if (NOT PORTAUDIO_LIBRARY)
+  message(FATAL_ERROR
+    "Could not find PortAudio static library in /mingw64/lib")
 else()
-  message(STATUS "Using locally built PortAudio Library: ${PORTAUDIO_LIBRARY}")
-  # The DLL is in /mingw64/bin, which should be in the PATH, so no extra linking steps needed here.
+  message(STATUS "Found PortAudio static library: ${PORTAUDIO_LIBRARY}")
 endif()
 
 #
@@ -122,3 +124,7 @@ else()
     $<$<BOOL:${ENABLE_SPEEX}>:speex>
   )
 endif()
+# Give the DLL the base name "iaxclient" instead of "iaxclient_lib"
+set_target_properties(iaxclient_lib PROPERTIES
+   OUTPUT_NAME "iaxclient"
+ )

@@ -1,33 +1,57 @@
-2025/4/27 AD7NP (cpicoto@hotmail.com)
+=======================================================================
+BUILDING THE LIBRARY for 64bits: (tested Windows 11 with MSYS2)
+2025/5/5 AD7NP (cpicoto@hotmail.com)
 
-MINGW64
-cd ~/
+
+Requirements:
+- Install MSYS2
+
+..
+..
+-----------------------------------------------------------------------
+- Install Portaudio Dependencies
+pacman -Syu                           # update packages
+pacman -S --needed base-devel git mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake mingw-w64-x86_64-pkg-config mingw-w64-x86_64-autotools
+
+- Clone and Build Portaudio from Source, we will build a static library and avoid an extra dll.
+cd ~
+git clone https://github.com/PortAudio/portaudio.git
+
+cd ~
+cd portaudio
+./configure \
+  --prefix=/mingw64 \
+  --disable-shared \
+  CFLAGS="-g -O0"
+make -j$(nproc)
+make install
+
+*Verify you now have
+ls -l /mingw64/lib/libportaudio.a
+
+
+------------------------------------------------------------------------
+- Clone and build the 64bit iaxclient Library
+
+cd ~
+git clone https://github.com/cpicoto/iaxclient.git
+
+
+cd ~/iaxclient/lib
 mkdir build
 cd ~/iaxclient/lib/build
+
 rm -rf CMakeCache.txt CMakeFiles
 
-$ rm -f CMakeCache.txt
-
-cpico@YLNRLAK-CPICOTO MINGW64 ~/iaxclient/lib/build
-cmake -G "MinGW Makefiles"       -DCMAKE_BUILD_TYPE=Debug       -DENABLE_SPEEX=ON       -DLIBIAX=ON       -DBUILDING_DLL=ON       ..
-
-
 *DEBUG*
-cpico@ROG-CPICOTO MINGW64 ~/iaxclient/lib/build
-cmake -G "MinGW Makefiles" \
-      -DCMAKE_BUILD_TYPE=Debug \
-      -DENABLE_SPEEX=ON \
-      -DLIBIAX=ON \
-      -DBUILDING_DLL=ON \
-      -DCMAKE_C_FLAGS="-g -O0" \
-      ..
+cd ~/iaxclient/lib/build
+cmake -G "MinGW Makefiles"   -DCMAKE_BUILD_TYPE=Debug   -DENABLE_SPEEX=ON   -DCMAKE_C_FLAGS="-g -O0"  ..
 
+mingw32-make -j$(nproc)
 
-
-
-cpico@YLNRLAK-CPICOTO MINGW64 ~/iaxclient/lib/build
-mingw32-make -j
-
+* Verify you now have libiaxclient.dll
+ls *.dll
+libiaxclient.dll
 =======================================================================
 BUILDING THE LIBRARY: (tested on Gentoo/Ubuntu/Windows XP/Windows 7)
 
