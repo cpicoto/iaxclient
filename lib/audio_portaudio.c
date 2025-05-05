@@ -107,6 +107,10 @@ static int mixers_initialized;
 
 static int current_audio_format = 0;  // Add this to track audio format
 static int pa_openwasapi(struct iaxc_audio_driver *d); //AD7NP move to wasapi
+/* actual WASAPI host rate and ratio for resampling */
+static double host_sample_rate = 0.0;  /* card’s native rate, e.g. 48000.0 */
+static double sample_ratio     = 1.0;  /* host_sample_rate / internal sample_rate (8000) */
+
 
 #define MAX_SAMPLE_RATE       48000
 #ifndef MS_PER_FRAME
@@ -122,14 +126,14 @@ static int pa_openwasapi(struct iaxc_audio_driver *d); //AD7NP move to wasapi
 
 /* RingBuffer Size; Needs to be Pow(2), 1024 = 512 samples = 64ms */
 #ifndef OUTRBSZ
-# define OUTRBSZ 32768
+# define OUTRBSZ 8192
 #endif
 
 /* Input ringbuffer size;  this doesn't seem to be as critical, and making it big
  * causes issues when we're answering calls, etc., and the audio system is running
  * but not being drained */
 #ifndef INRBSZ
-# define INRBSZ  2048
+# define INRBSZ  8192
 #endif
 
 /* TUNING:  The following constants may help in tuning for situations
@@ -164,7 +168,8 @@ static int pa_openwasapi(struct iaxc_audio_driver *d); //AD7NP move to wasapi
 /* size in bytes of ringbuffer target */
 #define RBOUTTARGET_BYTES (RBOUTTARGET * (sample_rate / 1000) * sizeof(SAMPLE))
 
-static char inRingBuf[INRBSZ], outRingBuf[OUTRBSZ];
+static char inRingBuf[INRBSZ*sizeof(SAMPLE)];
+static char outRingBuf[OUTRBSZ*sizeof(SAMPLE)];
 static PaUtilRingBuffer inRing, outRing;
 
 static int outRingLenAvg;
@@ -187,6 +192,7 @@ static int pa_start (struct iaxc_audio_driver *d );
 static void handle_paerror(PaError err, char * where);
 static int pa_input_level_set(struct iaxc_audio_driver *d, float level);
 static float pa_input_level_get(struct iaxc_audio_driver *d);
+static int pa_output_level_set(struct iaxc_audio_driver *d, float level);
 
 /* scan devices and stash pointers to dev structures.
  *  But, these structures only remain valid while Pa is initialized,
@@ -496,89 +502,38 @@ static void iaxc_echo_can(short *inputBuffer, short *outputBuffer, int n)
 #endif
 }
 
-static int pa_callback(void *inputBuffer, void *outputBuffer,
-	    unsigned long samplesPerFrame,
-	    const PaStreamCallbackTimeInfo* outTime,
-	    PaStreamCallbackFlags statusFlags,
-	    void *userData)
-{
-	int totBytes = samplesPerFrame * sizeof(SAMPLE);
+static int pa_callback(
+    const void                    *inputBuffer,
+          void                    *outputBuffer,
+    unsigned long                  hostFrames,
+    const PaStreamCallbackTimeInfo *timeInfo,
+    PaStreamCallbackFlags          statusFlags,
+    void                          *userData
+){
+    const SAMPLE *inBuf  = (const SAMPLE*)inputBuffer;
+    SAMPLE       *outBuf = (SAMPLE*)outputBuffer;
 
-	short virtualInBuffer[MAX_SAMPLES_PER_FRAME * 2];
-	short virtualOutBuffer[MAX_SAMPLES_PER_FRAME * 2];
+    /* DOWN-SAMPLE host → internal (8000 Hz) */
+    unsigned long intFrames = (unsigned long)(hostFrames / sample_ratio + 0.5);
+    for(unsigned long i = 0; i < intFrames; ++i) {
+        unsigned long srcIdx = (unsigned long)(i * sample_ratio);
+        if (srcIdx >= hostFrames) srcIdx = hostFrames-1;
+        SAMPLE s = inBuf[srcIdx];
+        PaUtil_WriteRingBuffer(&inRing, &s, 1);
+    }
 
-#if 0
-	/* I think this can't happen */
-	if(virtualMono && samplesPerFrame > SAMPLES_PER_FRAME) {
-		fprintf(stderr, "ERROR: buffer in callback is too big!\n");
-		exit(1);
-	}
-#endif
+    /* UP-SAMPLE internal → host */
+    for(unsigned long j = 0; j < hostFrames; ++j) {
+        SAMPLE outS = 0;
+        if (PaUtil_ReadRingBuffer(&outRing, &outS, 1) != 1) {
+            outS = 0;
+        }
+        outBuf[j] = outS;
+    }
 
-	if ( outputBuffer )
-	{
-		int bWritten;
-		/* output underflow might happen here */
-		if (virtualMonoOut)
-		{
-			bWritten = PaUtil_ReadRingBuffer(&outRing, virtualOutBuffer,
-					totBytes);
-			/* we zero "virtualOutBuffer", then convert the whole thing,
-			 * yes, because we use virtualOutBuffer for ec below */
-			if ( bWritten < totBytes )
-			{
-				memset(((char *)virtualOutBuffer) + bWritten,
-						0, totBytes - bWritten);
-				//fprintf(stderr, "*U*");
-			}
-			mono2stereo((SAMPLE *)outputBuffer, virtualOutBuffer,
-					samplesPerFrame);
-		}
-		else
-		{
-			bWritten = PaUtil_ReadRingBuffer(&outRing, outputBuffer, totBytes);
-			if ( bWritten < totBytes)
-			{
-				memset((char *)outputBuffer + bWritten,
-						0, totBytes - bWritten);
-				//fprintf(stderr, "*U*");
-			}
-		}
-
-		/* zero underflowed space [ silence might be more golden
-		 * than garbage? ] */
-
-		pa_mix_sounds(outputBuffer, samplesPerFrame, 0, virtualMonoOut);
-
-		if(!auxStream)
-			pa_mix_sounds(outputBuffer, samplesPerFrame, 1, virtualMonoOut);
-	}
-
-
-	if ( inputBuffer )
-	{
-		/* input overflow might happen here */
-		if ( virtualMonoIn )
-		{
-			stereo2mono(virtualInBuffer, (SAMPLE *)inputBuffer,
-					samplesPerFrame);
-			iaxc_echo_can(virtualInBuffer, virtualOutBuffer,
-					samplesPerFrame);
-
-			PaUtil_WriteRingBuffer(&inRing, virtualInBuffer, totBytes);
-		}
-		else
-		{
-			iaxc_echo_can((short *)inputBuffer,
-					(short *)outputBuffer,
-					samplesPerFrame);
-
-			PaUtil_WriteRingBuffer(&inRing, inputBuffer, totBytes);
-		}
-	}
-
-	return 0;
+    return paContinue;
 }
+
 
 static int pa_aux_callback(void *inputBuffer, void *outputBuffer,
 	    unsigned long samplesPerFrame,
@@ -742,33 +697,43 @@ static int pa_openstreams (struct iaxc_audio_driver *d )
 static int pa_openwasapi(struct iaxc_audio_driver *d)
 {
     PaError err;
+    /* 1) Find WASAPI host API */
     PaHostApiIndex apiIndex = Pa_HostApiTypeIdToHostApiIndex(paWASAPI);
     if (apiIndex < 0) {
-        PORT_LOG("pa_openwasapi: WASAPI host API not available");
+        PORT_LOG("pa_openwasapi: WASAPI not available");
         return -1;
     }
 
+    /* 2) Get default WASAPI devices */
     const PaHostApiInfo *apiInfo = Pa_GetHostApiInfo(apiIndex);
-    PaDeviceIndex inDev  = Pa_HostApiDeviceIndexToDeviceIndex(apiIndex, apiInfo->defaultInputDevice);
-    PaDeviceIndex outDev = Pa_HostApiDeviceIndexToDeviceIndex(apiIndex, apiInfo->defaultOutputDevice);
+    PaDeviceIndex inDev  = Pa_HostApiDeviceIndexToDeviceIndex(apiIndex,
+                                apiInfo->defaultInputDevice);
+    PaDeviceIndex outDev = Pa_HostApiDeviceIndexToDeviceIndex(apiIndex,
+                                apiInfo->defaultOutputDevice);
     if (inDev < 0 || outDev < 0) {
-        PORT_LOG("pa_openwasapi: no WASAPI I/O device available");
+        PORT_LOG("pa_openwasapi: no WASAPI I/O device");
         return -1;
     }
 
+    /* 3) Compute host rate and resample ratio */
+    host_sample_rate = Pa_GetDeviceInfo(inDev)->defaultSampleRate;
+    sample_ratio     = host_sample_rate / (double)sample_rate;
+    PORT_LOG("pa_openwasapi: host rate=%.1f Hz, ratio=%.3f", host_sample_rate, sample_ratio);
+
+    /* 4) Fill WASAPI-specific info */
     PaWasapiStreamInfo wasapiInfo = {
-        .size                   = sizeof(PaWasapiStreamInfo),
-        .hostApiType            = paWASAPI,
-        .version                = 1,
-        .flags                  = paWinWasapiUseChannelMask
-                                | paWinWasapiExplicitSampleFormat
-                                | paWinWasapiThreadPriority,
-        .threadPriority         = eThreadPriorityProAudio,
-        .channelMask            = PAWIN_SPEAKER_FRONT_CENTER,
-        .streamCategory         = eAudioCategoryCommunications,
-        .streamOption           = eStreamOptionNone
+        .size           = sizeof(PaWasapiStreamInfo),
+        .hostApiType    = paWASAPI,
+        .version        = 1,
+        .flags          = paWinWasapiUseChannelMask
+                        | paWinWasapiThreadPriority,
+        .threadPriority = eThreadPriorityProAudio,
+        .channelMask    = PAWIN_SPEAKER_FRONT_CENTER,  /* mono */
+        .streamCategory = eAudioCategoryCommunications,
+        .streamOption   = eStreamOptionNone
     };
 
+    /* 5) Fill your PortAudio parameters */
     PaStreamParameters inParams = {
         .device                    = inDev,
         .channelCount              = 1,
@@ -784,14 +749,15 @@ static int pa_openwasapi(struct iaxc_audio_driver *d)
         .hostApiSpecificStreamInfo = &wasapiInfo
     };
 
+    /* 6) Open full-duplex stream at host_sample_rate */
     err = Pa_OpenStream(
-        &iStream,         /* input+output in one full-duplex stream */
+        &iStream,
         &inParams,
         &outParams,
-        sample_rate,
+        host_sample_rate,
         paFramesPerBufferUnspecified,
         paNoFlag,
-        (PaStreamCallback *)pa_callback,   // cast to correct type
+        (PaStreamCallback *)pa_callback,
         d
     );
     if (err != paNoError) {
@@ -799,11 +765,13 @@ static int pa_openwasapi(struct iaxc_audio_driver *d)
         return -1;
     }
 
-    /* mark that input/output share oneStream */
+    /* 7) Use one stream for both in/out */
     oneStream = 1;
     oStream   = iStream;
+
     return 0;
 }
+
 /*---------------------------------------------------------------------------*/
 
 static int pa_openauxstream (struct iaxc_audio_driver *d )
@@ -909,8 +877,8 @@ static int pa_start(struct iaxc_audio_driver *d)
 	}
 
 	/* flush the ringbuffers */
-	PaUtil_InitializeRingBuffer(&inRing, 1, INRBSZ, inRingBuf);
-	PaUtil_InitializeRingBuffer(&outRing, 1, OUTRBSZ, outRingBuf);
+	PaUtil_InitializeRingBuffer(&inRing, sizeof(SAMPLE), INRBSZ, inRingBuf);
+	PaUtil_InitializeRingBuffer(&outRing, sizeof(SAMPLE), OUTRBSZ, outRingBuf);
 
 	if ( pa_openstreams(d) )
 	{
@@ -1040,29 +1008,35 @@ static int pa_input(struct iaxc_audio_driver *d, void *samples, int *nSamples)
 {
     int bytestoread;
     int available;
-
+    static int startup_counter = 0;
+    
     bytestoread = *nSamples * sizeof(SAMPLE);
-    PORT_LOG("pa_input: driver format=0x%x, samples=%p, nSamples=%d", 
-        current_audio_format, samples, *nSamples);
     
     /* Check how many bytes are available for reading */
     available = PaUtil_GetRingBufferReadAvailable(&inRing);
     
-    /* we don't return partial buffers */
-    if (available < bytestoread)
-    {
-        PORT_LOG("Ring buffer read: available=%d, requested=%d INSUFFICIENT!", 
-            available, bytestoread);
+    /* During startup, be more tolerant of partial buffers */
+    if (available < bytestoread) {
+        if (startup_counter++ < 100) {
+            // During initial startup, return 0 samples instead of error
+            *nSamples = 0;
+            return 0;
+        }
+        
+        // After startup period, return error code
         *nSamples = 0;
-        return 0;
+        return 1;
     }
-
-    int bytes_read = PaUtil_ReadRingBuffer(&inRing, samples, bytestoread);
-    PORT_LOG("Ring buffer read: available=%d, requested=%d %s", 
-        available, bytestoread, (bytes_read < bytestoread) ? "PARTIAL READ!" : "ok");
-
+    
+    // Reset startup counter when we successfully read a buffer
+    startup_counter = 0;
+    
+    /* Read the data from the buffer */
+    PaUtil_ReadRingBuffer(&inRing, samples, bytestoread);
+    
     return 0;
 }
+
 
 static int pa_output(struct iaxc_audio_driver *d, void *samples, int nSamples)
 {
@@ -1268,8 +1242,8 @@ static int _pa_initialize (struct iaxc_audio_driver *d, int sr)
 	sounds = NULL;
 	MUTEXINIT(&sound_lock);
 
-	PaUtil_InitializeRingBuffer(&inRing, 1, INRBSZ, inRingBuf);
-	PaUtil_InitializeRingBuffer(&outRing, 1, OUTRBSZ, outRingBuf);
+	PaUtil_InitializeRingBuffer(&inRing, sizeof(SAMPLE), INRBSZ, inRingBuf);
+	PaUtil_InitializeRingBuffer(&outRing, sizeof(SAMPLE), OUTRBSZ, outRingBuf);
 
 	running = 0;
     PORT_LOG("PortAudio initialization complete");
