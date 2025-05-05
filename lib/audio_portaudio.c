@@ -37,7 +37,7 @@
 #include "iaxclient_lib.h"
 #include "portmixer.h"
 #include <pa_win_wasapi.h>    /* for PaWasapiStreamInfo */
-
+#include <speex/speex_resampler.h> // Add Speex resampler header
 
 #ifdef _WIN32
   #include <winsock2.h>
@@ -111,6 +111,7 @@ static int pa_openwasapi(struct iaxc_audio_driver *d); //AD7NP move to wasapi
 /* actual WASAPI host rate and ratio for resampling */
 static double host_sample_rate = 0.0;  /* card’s native rate, e.g. 48000.0 */
 static double sample_ratio     = 1.0;  /* host_sample_rate / internal sample_rate (8000) */
+static SpeexResamplerState *speex_resampler = NULL;
 
 
 #define MAX_SAMPLE_RATE       48000
@@ -523,48 +524,58 @@ static int pa_callback(
         return paContinue;
     }
     
-    // Simple resampling with more samples per batch
-    if (host_sample_rate > sample_rate) {
-        int step = (int)sample_ratio;
+    // Use Speex resampler if we have different sample rates
+    if (speex_resampler && host_sample_rate > sample_rate) {
+        // Create buffer for resampled output
+        static SAMPLE resampled_buffer[2048]; // Buffer for resampled output
         
-        // Create a larger batch to process - we need at least 160 samples per batch
-        static SAMPLE batch_buffer[480]; // 3x160 samples to ensure we have enough
-        static int batch_count = 0;
-        int count = 0;
+        // Calculate the number of output samples we expect based on the ratio
+        spx_uint32_t in_len = hostFrames;
+        spx_uint32_t out_len = (spx_uint32_t)(hostFrames / sample_ratio) + 1;
         
-        // Pick every Nth sample (decimation)
-        for (unsigned long i = 0; i < hostFrames && batch_count < 480; i += step) {
-            batch_buffer[batch_count++] = inBuf[i];
-            count++;
+        // Make sure we don't exceed our buffer size
+        if (out_len > 2048) {
+            out_len = 2048;
+            PORT_LOG("Warning: Limiting resampler output size to 2048 samples");
         }
         
-        // Only write to ring buffer when we have enough samples
-        if (batch_count >= 120) {  // Lower threshold to 120 for more frequent writes
-            // Write the full batch to the ring buffer
-            int written = PaUtil_WriteRingBuffer(&inRing, batch_buffer, batch_count);
-            
-            if (debug_counter++ % 50 == 0) {
-                PORT_LOG("PA_CALLBACK: Added %d samples to ring buffer (%d written)", 
-                        batch_count, written);
-            }
-            
-            // Reset the batch counter
-            batch_count = 0;
+        // Process audio through the resampler
+        int err = speex_resampler_process_int(
+            speex_resampler,
+            0, // Channel index (0 for mono)
+            inBuf,
+            &in_len,
+            resampled_buffer,
+            &out_len
+        );
+        
+        if (err != RESAMPLER_ERR_SUCCESS) {
+            PORT_LOG("Speex resampling error: %s", speex_resampler_strerror(err));
+        }
+        
+        // Write resampled audio to the ring buffer
+        int written = PaUtil_WriteRingBuffer(&inRing, resampled_buffer, out_len);
+        
+        if (debug_counter++ % 100 == 0) {
+            PORT_LOG("PA_CALLBACK: Resampled %lu frames to %lu frames (%d written to buffer)",
+                    hostFrames, (unsigned long)out_len, written);
         }
     } else {
-        // Direct copy if no resampling needed
+        // If no resampling needed or no resampler available, use direct copy
         PaUtil_WriteRingBuffer(&inRing, inBuf, hostFrames);
     }
     
-    // Output - simple zero-order hold (repeat samples)
-    for (unsigned long j = 0; j < hostFrames; ++j) {
-        SAMPLE outS = 0;
-        if (j % (int)sample_ratio == 0) {
-            if (PaUtil_ReadRingBuffer(&outRing, &outS, 1) != 1) {
-                outS = 0;
+    // Output processing - simple zero-order hold (repeat samples)
+    if (outputBuffer) {
+        for (unsigned long j = 0; j < hostFrames; ++j) {
+            SAMPLE outS = 0;
+            if (j % (int)sample_ratio == 0) {
+                if (PaUtil_ReadRingBuffer(&outRing, &outS, 1) != 1) {
+                    outS = 0;
+                }
             }
+            outBuf[j] = outS;
         }
-        outBuf[j] = outS;
     }
     
     return paContinue;
@@ -768,6 +779,32 @@ static int pa_openwasapi(struct iaxc_audio_driver *d)
     PORT_LOG("pa_openwasapi: Requested WASAPI to deliver audio at %.1fHz (native rate) with resampling to %d Hz", 
             host_sample_rate, sample_rate);
 
+    // Initialize Speex resampler if needed
+    if (speex_resampler) {
+        speex_resampler_destroy(speex_resampler);
+        speex_resampler = NULL;
+    }
+    
+    // Only create resampler if sample rates differ
+    if (host_sample_rate != sample_rate) {
+        int err;
+        speex_resampler = speex_resampler_init(
+            1,                             // 1 channel (mono)
+            (spx_uint32_t)host_sample_rate, // Input rate (48000)
+            (spx_uint32_t)sample_rate,      // Output rate (8000)
+            5,                             // Quality (0-10, 5 is good quality)
+            &err
+        );
+        
+        if (err != RESAMPLER_ERR_SUCCESS) {
+            PORT_LOG("Failed to initialize Speex resampler: %s", 
+                     speex_resampler_strerror(err));
+        } else {
+            PORT_LOG("Speex resampler initialized: %d Hz → %d Hz", 
+                     (int)host_sample_rate, sample_rate);
+        }
+    }
+
     // Fix zero audio format issue
     if (current_audio_format == 0) {
         current_audio_format = paInt16;
@@ -808,9 +845,9 @@ static int pa_openwasapi(struct iaxc_audio_driver *d)
         &inParams,
         &outParams,
         host_sample_rate,  // Use native 48kHz rate
-        1024,  // Explicit buffer size helps with stability
+        1024,              // Explicit buffer size helps with stability
         paNoFlag,
-        pa_callback,  // Callback is already set here
+        pa_callback,       // Callback is already set here
         d
     );
     
@@ -823,12 +860,6 @@ static int pa_openwasapi(struct iaxc_audio_driver *d)
     oneStream = 1;
     oStream = iStream;
     
-    // 8) Remove this problematic call
-    // err = Pa_SetStreamCallback(iStream, pa_callback, d);
-    // if (err != paNoError) {
-    //     PORT_LOG("pa_openwasapi: Failed to explicitly set callback: %s", Pa_GetErrorText(err));
-    // }
-
     return 0;
 }
 /*---------------------------------------------------------------------------*/
@@ -1167,6 +1198,12 @@ static int pa_selected_devices(struct iaxc_audio_driver *d, int *input,
 
 static int pa_destroy(struct iaxc_audio_driver *d)
 {
+	// Clean up Speex resampler if it was created
+	if (speex_resampler) {
+		speex_resampler_destroy(speex_resampler);
+		speex_resampler = NULL;
+	}
+	
 	if( iMixer )
 	{
 		Px_CloseMixer(iMixer);
