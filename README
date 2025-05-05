@@ -13,14 +13,15 @@ cmake -G "MinGW Makefiles"       -DCMAKE_BUILD_TYPE=Debug       -DENABLE_SPEEX=O
 
 
 *DEBUG*
-cmake -G "MinGW Makefiles" \
+cpico@ROG-CPICOTO MINGW64 ~/iaxclient/lib/build
+$ cmake -G "MinGW Makefiles" \
       -DCMAKE_BUILD_TYPE=Debug \
       -DENABLE_SPEEX=ON \
       -DLIBIAX=ON \
       -DBUILDING_DLL=ON \
       -DCMAKE_C_FLAGS="-g -O0" \
-      -DSAVE_LOCAL
       ..
+
 
 
 

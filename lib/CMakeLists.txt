@@ -14,7 +14,7 @@ if(APPLE)
   add_definitions(-DMACOSX)
 endif()
 
-option(ENABLE_SPEEX "Compile with Speex preprocessing & codec support" OFF)
+option(ENABLE_SPEEX "Compile with Speex preprocessing & codec support" ON)  # Changed from OFF to ON
 
 #
 # Include paths
@@ -83,6 +83,9 @@ if(ENABLE_SPEEX)
   if(NOT SPEEX_LIBRARY OR NOT SPEEXDSP_LIBRARY)
     message(FATAL_ERROR "ENABLE_SPEEX=ON but libspeex or libspeexdsp not found! Install the MSYS2 speex and speexdsp packages.")
   endif()
+  
+  # Add this line to define HAVE_SPEEX_DSP when Speex is enabled
+  add_definitions(-DHAVE_SPEEX_DSP)
 endif()
 
 #
