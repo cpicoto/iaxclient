@@ -1831,9 +1831,7 @@ int iax_register(struct iax_session *session, const char *server, const char *pe
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
     if ((sa.sin_addr.s_addr = inet_addr(tmp)) != INADDR_NONE) {
-#ifdef DEBUG_SUPPORT		
-        IAX_LOG("Already an IP address\n");
-#endif
+
     } else {
         /* Connect through DNS */
         hp = gethostbyname(tmp);
@@ -1852,10 +1850,7 @@ int iax_register(struct iax_session *session, const char *server, const char *pe
     strncpy(session->username, peer, sizeof(session->username) - 1);
     session->refresh = refresh;
     iax_ie_append_str(&ied, IAX_IE_USERNAME, peer);
-    iax_ie_append_short(&ied, IAX_IE_REFRESH, refresh);
-#ifdef DEBUG_SUPPORT	
-    IAX_LOG("iax_register: Sending register request\n");
-#endif
+    iax_ie_append_short(&ied, IAX_IE_REFRESH, refresh);	
     res = send_command(session, AST_FRAME_IAX, IAX_COMMAND_REGREQ, 0, ied.buf, ied.pos, -1);
     return res;
 }

@@ -126,14 +126,14 @@ static double sample_ratio     = 1.0;  /* host_sample_rate / internal sample_rat
 
 /* RingBuffer Size; Needs to be Pow(2), 1024 = 512 samples = 64ms */
 #ifndef OUTRBSZ
-# define OUTRBSZ 8192
+# define OUTRBSZ (16384)
 #endif
 
 /* Input ringbuffer size;  this doesn't seem to be as critical, and making it big
  * causes issues when we're answering calls, etc., and the audio system is running
  * but not being drained */
 #ifndef INRBSZ
-# define INRBSZ  8192
+# define INRBSZ  (16384)
 #endif
 
 /* TUNING:  The following constants may help in tuning for situations
@@ -512,25 +512,50 @@ static int pa_callback(
 ){
     const SAMPLE *inBuf  = (const SAMPLE*)inputBuffer;
     SAMPLE       *outBuf = (SAMPLE*)outputBuffer;
-
-    /* DOWN-SAMPLE host → internal (8000 Hz) */
-    unsigned long intFrames = (unsigned long)(hostFrames / sample_ratio + 0.5);
-    for(unsigned long i = 0; i < intFrames; ++i) {
-        unsigned long srcIdx = (unsigned long)(i * sample_ratio);
-        if (srcIdx >= hostFrames) srcIdx = hostFrames-1;
-        SAMPLE s = inBuf[srcIdx];
-        PaUtil_WriteRingBuffer(&inRing, &s, 1);
+    
+    // Skip processing if no input buffer
+    if (!inputBuffer) {
+        if (outputBuffer) {
+            memset(outBuf, 0, hostFrames * sizeof(SAMPLE));
+        }
+        return paContinue;
     }
-
-    /* UP-SAMPLE internal → host */
-    for(unsigned long j = 0; j < hostFrames; ++j) {
+    
+    // Simple resampling - just take every Nth sample
+    // This is less CPU intensive than averaging
+    if (host_sample_rate > sample_rate) {
+        int step = (int)sample_ratio;
+        int count = 0;
+        
+        // Pick every Nth sample (decimation)
+        for (unsigned long i = 0; i < hostFrames; i += step) {
+            SAMPLE s = inBuf[i];
+            PaUtil_WriteRingBuffer(&inRing, &s, 1);
+            count++;
+        }
+        
+        // Log occasionally to show progress
+        static int debug_counter = 0;
+        if ((debug_counter++ % 500) == 0) {
+            PORT_LOG("PA_CALLBACK: Resampling %lu host frames to %d (step=%d)", 
+                    hostFrames, count, step);
+        }
+    } else {
+        // Direct copy if no resampling needed
+        PaUtil_WriteRingBuffer(&inRing, inBuf, hostFrames);
+    }
+    
+    // Output - simple zero-order hold (repeat samples)
+    for (unsigned long j = 0; j < hostFrames; ++j) {
         SAMPLE outS = 0;
-        if (PaUtil_ReadRingBuffer(&outRing, &outS, 1) != 1) {
-            outS = 0;
+        if (j % (int)sample_ratio == 0) {
+            if (PaUtil_ReadRingBuffer(&outRing, &outS, 1) != 1) {
+                outS = 0;
+            }
         }
         outBuf[j] = outS;
     }
-
+    
     return paContinue;
 }
 
@@ -834,11 +859,12 @@ static int pa_start(struct iaxc_audio_driver *d)
 {
 	static int errcnt = 0;
 	current_audio_format = paInt16;  // Fix for 0x0 format issue
-    PORT_LOG("pa_start:Explicitly setting audio format to 0x%x (paInt16)", current_audio_format);
+
 
 	if ( running )
 		return 0;
 
+	PORT_LOG("pa_start: format to 0x%x (paInt16)", current_audio_format);
 	// Add format check
 	if (d != NULL) {
 		PORT_LOG("pa_start:Audio format before start: 0x%x %s", 
@@ -1257,7 +1283,7 @@ int pa_initialize(struct iaxc_audio_driver *d, int sr)
 	PORT_LOG("pa_initialize: Setting up audio driver with sample rate %d", sr);
 	_pa_initialize(d, sr);
     current_audio_format = paInt16;  // Fix for 0x0 format issue
-    PORT_LOG("Explicitly setting audio format to 0x%x (paInt16)", current_audio_format);
+    PORT_LOG("pa_initialize(2): Explicitly setting audio format to 0x%x (paInt16)", current_audio_format);
 
 	/* TODO: Kludge alert. We only do the funny audio start-stop
 	 * business if iaxci_audio_output_mode is not set. This is a

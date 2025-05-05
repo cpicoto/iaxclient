@@ -20,7 +20,7 @@
 +static MUTEX sound_lock;
 
  /* forward declarations */
- static int pa_start(struct iaxc_audio_driver *d);
+ static int (struct iaxc_audio_driver *d);
 +static int pa_openstreams(struct iaxc_audio_driver *d);
 +/* new: WASAPI helper */
 +static int pa_openwasapi(struct iaxc_audio_driver *d);
