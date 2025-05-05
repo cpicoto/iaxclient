@@ -1,0 +1,23 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../openal-soft"
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"algorithm": "cpp",
+			"chrono": "cpp",
+			"limits": "cpp",
+			"utility": "cpp",
+			"xutility": "cpp",
+			"audio_encode.h": "c",
+			"codec_gsm.h": "c",
+			"codec_speex.h": "c",
+			"stdlib.h": "c"
+		}
+	}
+}

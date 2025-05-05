@@ -895,6 +895,8 @@ static int get_sample_cnt(struct iax_event *e)
 static int iax_xmit_frame(struct iax_frame *f)
 {
 	int res;
+
+
 #ifdef DEBUG_SUPPORT
 	if (debug) {
 		struct ast_iax2_full_hdr *h = (struct ast_iax2_full_hdr *)f->data;
@@ -904,6 +906,7 @@ static int iax_xmit_frame(struct iax_frame *f)
 										&(f->session->transfer) :
 										&(f->session->peeraddr),
 										f->datalen - sizeof(struct ast_iax2_full_hdr));
+
 	}
 #endif
     if(!iax_session_valid(f->session)) {

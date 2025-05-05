@@ -128,6 +128,9 @@ static struct iaxc_speex_settings speex_settings =
 	3     /* complexity */
 };
 
+/* Forward declarations for PTT filter functions */
+EXPORT void iaxc_ptt_filters_disable(void);
+EXPORT void iaxc_ptt_filters_restore(void);
 
 static float vol_to_db(float vol)
 {
@@ -391,7 +394,7 @@ EXPORT void iaxc_set_speex_settings(int decode_enhance, float quality,
 }
 
 int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
-		int format, int samples)
+        int format, int samples)
 {
     unsigned char outbuf[1024];
     int outsize = 1024;
@@ -401,7 +404,7 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
     /* update last input timestamp */
     timeLastInput = iax_tvnow();
     
-    // First record all audio regardless of whether it's "silent"
+    // Only record audio to WAV file - don't process it for silence detection
     if (audio_capture_file) {
         short *samples_ptr = (short *)data;
         // Add statistics gathering
@@ -410,7 +413,7 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
             if (samples_ptr[i] < audio_min_sample) audio_min_sample = samples_ptr[i];
         }
         
-        // Write raw PCM data to file regardless of silence status
+        // Write raw PCM data to file
         size_t written = fwrite(data, sizeof(short), insize, audio_capture_file);
         if (written != insize) {
             AUDIO_LOG("WARNING: Failed to write all audio data: %zu/%d written", written, insize);
@@ -420,9 +423,26 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
         fflush(audio_capture_file);
     }
     
-    // Now process audio normally for IAX transmission with silence detection
-    int silent = input_postprocess(data, insize, 8000);
+    // MODIFIED: Only do silence detection if not in PTT mode
+    int silent = 0;
+    static int ptt_active = 0;
     
+    if (audio_capture_file != NULL) {
+        // PTT is active, skip silence detection completely
+        ptt_active = 1;
+        // Set input level for better audio during PTT
+        iaxc_input_level_set(0.8f);
+        AUDIO_LOG("PTT active: BYPASSING SILENCE DETECTION");
+    } else {
+        // Only do normal silence detection when PTT is not active
+        silent = input_postprocess(data, insize, 8000);
+        if (ptt_active) {
+            // PTT was active but now stopped, reset flag
+            ptt_active = 0;
+            AUDIO_LOG("PTT inactive: Returning to normal silence detection");
+        }
+    }
+
     // Continue with regular IAX silence handling
     if(silent)
     {
@@ -444,7 +464,7 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
         call->encoder->destroy(call->encoder);
         call->encoder = NULL;
     }
-
+    AUDIO_LOG("Currently using format: 0x%x (must be not zero)", format);
     /* just break early if there's no format defined: this happens for the
      * first couple of frames of new calls */
     if(format == 0) return 0;
@@ -452,13 +472,16 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
     /* create encoder if necessary */
     if(!call->encoder)
     {
+        AUDIO_LOG("Creating encoder for format: 0x%x", format);
         call->encoder = create_codec(format);
+        AUDIO_LOG("Encoder creation result: %s", call->encoder ? "SUCCESS" : "FAILED");
     }
 
     if(!call->encoder)
     {
         /* ERROR: no codec */
         fprintf(stderr, "ERROR: Codec could not be created: %d\n", format);
+        AUDIO_LOG("ERROR: Codec could not be created: %d\n", format);
         return 0;
     }
 
@@ -469,25 +492,27 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
         fprintf(stderr, "ERROR: encode error: %d\n", format);
         return 0;
     }
-
-    if(samples-insize == 0)
-    {
-        fprintf(stderr, "ERROR encoding (no samples output (samples=%d)\n", samples);
-        return -1;
-    }
+    AUDIO_LOG("Encoded %d bytes of audio data", sizeof(outbuf) - outsize);
 
     // Send the encoded audio data back to the app if required
-    // TODO: fix the stupid way in which the encoded audio size is returned
-    if ( iaxc_get_audio_prefs() & IAXC_AUDIO_PREF_RECV_LOCAL_ENCODED )
+    if (iaxc_get_audio_prefs() & IAXC_AUDIO_PREF_RECV_LOCAL_ENCODED) {
+        AUDIO_LOG("Sending local encoded audio back to app (size=%d)", outsize);
         iaxci_do_audio_callback(callNo, 0, IAXC_SOURCE_LOCAL, 1,
                 call->encoder->format & IAXC_AUDIO_FORMAT_MASK,
                 sizeof(outbuf) - outsize, outbuf);
+    } else {
+        AUDIO_LOG("Not sending local encoded audio back to app (not enabled)");
+    }
 
-    if(iax_send_voice(call->session,format, outbuf,
+    // Always send voice data regardless of callback preferences
+    if(iax_send_voice(call->session, format, outbuf,
                 sizeof(outbuf) - outsize, samples-insize) == -1)
     {
         fprintf(stderr, "Failed to send voice! %s\n", iax_errstr);
+        AUDIO_LOG("Failed to send voice! %s\n", iax_errstr);
         return -1;
+    } else {
+        AUDIO_LOG("Sent %d bytes of encoded audio data", sizeof(outbuf) - outsize);
     }
 
     return 0;
@@ -739,6 +764,9 @@ EXPORT void iaxc_ptt_audio_capture_start(void) {
     
     audio_capture_file = file;
     AUDIO_LOG("SUCCESS: Started PTT audio capture: %s (8000Hz sample rate)", filename);
+    
+    // Disable filters for better audio quality
+    iaxc_ptt_filters_disable();
 }
 
 // Function to stop recording on PTT release
@@ -769,6 +797,9 @@ EXPORT void iaxc_ptt_audio_capture_stop(void) {
         AUDIO_LOG("------------------------------------------");
         
         audio_capture_file = NULL;
+        
+        // Restore filters
+        iaxc_ptt_filters_restore();
     }
     
     audio_samples_written = 0;
@@ -788,5 +819,53 @@ EXPORT void iaxc_handle_audio_event(const char* message) {
         iaxc_ptt_audio_capture_stop();
         fprintf(stderr, "Stopped audio recording on PTT release\n");
     }
+}
+
+void test_send_reference_tone(struct iaxc_call *call, int callNo) {
+    // Generate 5 seconds of a 1kHz sine wave
+    const int sample_rate = 8000;
+    const int duration_sec = 5;
+    const int total_samples = sample_rate * duration_sec;
+    const float freq = 1000.0f;
+    
+    short *sine_wave = malloc(total_samples * sizeof(short));
+    if (!sine_wave) return;
+    
+    // Generate sine wave
+    for (int i = 0; i < total_samples; i++) {
+        sine_wave[i] = (short)(10000.0f * sin(2.0f * M_PI * freq * i / sample_rate));
+    }
+    
+    // Send in chunks of 160 samples (20ms)
+    for (int i = 0; i < total_samples; i += 160) {
+        int chunk_size = (i + 160 <= total_samples) ? 160 : (total_samples - i);
+        audio_send_encoded_audio(call, callNo, &sine_wave[i], AST_FORMAT_SLINEAR, chunk_size);
+        // Sleep for 20ms to simulate real-time
+#ifdef _WIN32
+        Sleep(20);  // Windows Sleep takes milliseconds
+#else
+        usleep(20000);  // POSIX usleep takes microseconds
+#endif
+    }
+    
+    free(sine_wave);
+    AUDIO_LOG("Finished sending test tone");
+}
+
+// Temporarily disable/restore filters during PTT operations
+static int saved_filters = 0;
+
+EXPORT void iaxc_ptt_filters_disable(void) {
+    // Save current filters and disable most processing
+    saved_filters = iaxci_filters;
+    // Keep only minimal necessary filters
+    iaxc_set_filters(0);
+    AUDIO_LOG("PTT: Disabled audio filters for better voice quality");
+}
+
+EXPORT void iaxc_ptt_filters_restore(void) {
+    // Restore previous filters
+    iaxc_set_filters(saved_filters);
+    AUDIO_LOG("PTT: Restored audio filters to previous settings");
 }
 
