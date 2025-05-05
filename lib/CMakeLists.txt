@@ -104,6 +104,11 @@ else()
   message(STATUS "Found PortAudio static library: ${PORTAUDIO_LIBRARY}")
 endif()
 
+# Add setupapi to the linked libraries
+if(WIN32)
+    set(PLATFORM_LIBS ${PLATFORM_LIBS} setupapi)
+endif()
+
 #
 # Link libraries
 #
@@ -115,6 +120,7 @@ if(WIN32)
     winmm                 # Add the Windows Multimedia library
     $<$<BOOL:${ENABLE_SPEEX}>:${SPEEXDSP_LIBRARY}>
     $<$<BOOL:${ENABLE_SPEEX}>:${SPEEX_LIBRARY}>
+    ${PLATFORM_LIBS}
   )
 else()
   target_link_libraries(iaxclient_lib

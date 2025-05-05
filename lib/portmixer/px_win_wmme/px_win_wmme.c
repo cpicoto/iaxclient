@@ -153,7 +153,7 @@ PxMixer *Px_OpenMixer( void *pa_stream, int index )
    }
 
    if (hWaveIn) {
-      result = mixerOpen((HMIXER *)&mixer->hInputMixer, (UINT)hWaveIn, 0, 0, MIXER_OBJECTF_HWAVEIN);
+      result = mixerOpen((HMIXER *)&mixer->hInputMixer, (UINT_PTR)hWaveIn, 0, 0, MIXER_OBJECTF_HWAVEIN);
       if (result != MMSYSERR_NOERROR) {
          free(mixer);
          return NULL;
@@ -161,7 +161,7 @@ PxMixer *Px_OpenMixer( void *pa_stream, int index )
    }
 
    if (hWaveOut) {
-      result = mixerOpen((HMIXER *)&mixer->hOutputMixer, (UINT)hWaveOut, 0, 0, MIXER_OBJECTF_HWAVEOUT);
+      result = mixerOpen((HMIXER *)&mixer->hOutputMixer, (UINT_PTR)hWaveOut, 0, 0, MIXER_OBJECTF_HWAVEOUT);
       if (result != MMSYSERR_NOERROR) {
          free(mixer);
          return NULL;

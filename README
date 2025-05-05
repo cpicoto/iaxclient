@@ -26,6 +26,14 @@ cd portaudio
 make -j$(nproc)
 make install
 
+* Better 
+cd ~
+cd portaudio
+mkdir build
+cmake  -G "MinGW Makefiles"  -DCMAKE_INSTALL_PREFIX=/mingw64  -DBUILD_SHARED_LIBS=OFF   -DPA_USE_WASAPI=ON   -DPA_USE_WMME=OFF  -DPA_USE_DS=OFF  -DCMAKE_BUILD_TYPE=Debug   ..
+mingw32-make
+mingw32-make install
+
 *Verify you now have
 ls -l /mingw64/lib/libportaudio.a
 

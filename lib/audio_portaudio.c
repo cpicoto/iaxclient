@@ -724,6 +724,7 @@ static int pa_openstreams (struct iaxc_audio_driver *d )
 	if (err)
 	{
 		handle_paerror(err, "Unable to open streams");
+		PORT_LOG("Unable to open streams: %d", err);
 		return -1;
 	}
 	return 0;
@@ -789,21 +790,21 @@ static int pa_start(struct iaxc_audio_driver *d)
 {
 	static int errcnt = 0;
 	current_audio_format = paInt16;  // Fix for 0x0 format issue
-    PORT_LOG("Explicitly setting audio format to 0x%x (paInt16)", current_audio_format);
+    PORT_LOG("pa_start:Explicitly setting audio format to 0x%x (paInt16)", current_audio_format);
 
 	if ( running )
 		return 0;
 
 	// Add format check
 	if (d != NULL) {
-		PORT_LOG("Audio format before start: 0x%x %s", 
+		PORT_LOG("pa_start:Audio format before start: 0x%x %s", 
 			current_audio_format, 
 			(current_audio_format == 0) ? "INVALID!" : "ok");
 		
 		// Fix zero format if needed
 		if (current_audio_format == 0) {
 			current_audio_format = paInt16;
-			PORT_LOG("Fixed zero format to 0x%x (paInt16)", current_audio_format);
+			PORT_LOG("pa_start:Fixed zero format to 0x%x (paInt16)", current_audio_format);
 		}
 	}
 	/* re-open mixers if necessary */
@@ -826,6 +827,7 @@ static int pa_start(struct iaxc_audio_driver *d)
 				"Perhaps you do not have an input or output device?");
 		/* OK, we'll give the application the option to abort or
 		 * not here, but we will throw a fatal error anyway */
+		PORT_LOG("pa_start:Unable to open audio device after 5 attempts. Giving up.");
 		iaxc_millisleep(1000);
 		//return -1; // Give Up.  Too many errors.
 	}
@@ -890,7 +892,7 @@ static int pa_start(struct iaxc_audio_driver *d)
 						Px_GetInputSourceName(iMixer, n)) )
 				{
 					Px_SetCurrentInputSource( iMixer, n );
-					PORT_LOG("Using microphone input source %d", n);
+					PORT_LOG("pa_start:Using microphone input source %d", n);
 				}
 			}
 		}
@@ -908,7 +910,7 @@ static int pa_start(struct iaxc_audio_driver *d)
 			pa_input_level_set(d, 0.6f);
 		mixers_initialized = 1;
 	}
-    PORT_LOG("Streams started successfully");
+    PORT_LOG("pa_start:Streams started successfully");
 	running = 1;
 	return 0;
 }
