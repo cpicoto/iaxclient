@@ -14,7 +14,9 @@
 			"audio_encode.h": "c",
 			"codec_gsm.h": "c",
 			"codec_speex.h": "c",
-			"stdlib.h": "c"
+			"stdlib.h": "c",
+			"pa_ringbuffer.h": "c",
+			"pa_win_wasapi.h": "c"
 		}
 	}
 }

@@ -36,6 +36,7 @@
 #include "audio_portaudio.h"
 #include "iaxclient_lib.h"
 #include "portmixer.h"
+#include <pa_win_wasapi.h>    /* for PaWasapiStreamInfo */
 
 
 #ifdef _WIN32
@@ -105,6 +106,7 @@ static int sample_rate = 8000;
 static int mixers_initialized;
 
 static int current_audio_format = 0;  // Add this to track audio format
+static int pa_openwasapi(struct iaxc_audio_driver *d); //AD7NP move to wasapi
 
 #define MAX_SAMPLE_RATE       48000
 #ifndef MS_PER_FRAME
@@ -702,7 +704,13 @@ static int pa_open(int single, int inMono, int outMono)
 static int pa_openstreams (struct iaxc_audio_driver *d )
 {
 	int err;
-
+#ifdef _WIN32
+    /* On Windows, use our WASAPI helper: */
+    return pa_openwasapi(d);
+#else
+    /* On other platforms, fall back to the old PortAudio open: */
+    return pa_open(d);
+#endif
 #ifdef LINUX
 	err = pa_open(0, 1, 1) && /* two stream mono */
 		pa_open(1, 1, 1) &&   /* one stream mono */
@@ -729,6 +737,74 @@ static int pa_openstreams (struct iaxc_audio_driver *d )
 	}
 	return 0;
 }
+/*---------------------------------------------------------------------------*/
+/* WASAPI‐specific full‐duplex open */
+static int pa_openwasapi(struct iaxc_audio_driver *d)
+{
+    PaError err;
+    PaHostApiIndex apiIndex = Pa_HostApiTypeIdToHostApiIndex(paWASAPI);
+    if (apiIndex < 0) {
+        PORT_LOG("pa_openwasapi: WASAPI host API not available");
+        return -1;
+    }
+
+    const PaHostApiInfo *apiInfo = Pa_GetHostApiInfo(apiIndex);
+    PaDeviceIndex inDev  = Pa_HostApiDeviceIndexToDeviceIndex(apiIndex, apiInfo->defaultInputDevice);
+    PaDeviceIndex outDev = Pa_HostApiDeviceIndexToDeviceIndex(apiIndex, apiInfo->defaultOutputDevice);
+    if (inDev < 0 || outDev < 0) {
+        PORT_LOG("pa_openwasapi: no WASAPI I/O device available");
+        return -1;
+    }
+
+    PaWasapiStreamInfo wasapiInfo = {
+        .size                   = sizeof(PaWasapiStreamInfo),
+        .hostApiType            = paWASAPI,
+        .version                = 1,
+        .flags                  = paWinWasapiUseChannelMask
+                                | paWinWasapiExplicitSampleFormat
+                                | paWinWasapiThreadPriority,
+        .threadPriority         = eThreadPriorityProAudio,
+        .channelMask            = PAWIN_SPEAKER_FRONT_CENTER,
+        .streamCategory         = eAudioCategoryCommunications,
+        .streamOption           = eStreamOptionNone
+    };
+
+    PaStreamParameters inParams = {
+        .device                    = inDev,
+        .channelCount              = 1,
+        .sampleFormat              = current_audio_format,
+        .suggestedLatency          = Pa_GetDeviceInfo(inDev)->defaultLowInputLatency,
+        .hostApiSpecificStreamInfo = &wasapiInfo
+    };
+    PaStreamParameters outParams = {
+        .device                    = outDev,
+        .channelCount              = 1,
+        .sampleFormat              = current_audio_format,
+        .suggestedLatency          = Pa_GetDeviceInfo(outDev)->defaultLowOutputLatency,
+        .hostApiSpecificStreamInfo = &wasapiInfo
+    };
+
+    err = Pa_OpenStream(
+        &iStream,         /* input+output in one full-duplex stream */
+        &inParams,
+        &outParams,
+        sample_rate,
+        paFramesPerBufferUnspecified,
+        paNoFlag,
+        (PaStreamCallback *)pa_callback,   // cast to correct type
+        d
+    );
+    if (err != paNoError) {
+        PORT_LOG("pa_openwasapi: Pa_OpenStream failed: %s", Pa_GetErrorText(err));
+        return -1;
+    }
+
+    /* mark that input/output share oneStream */
+    oneStream = 1;
+    oStream   = iStream;
+    return 0;
+}
+/*---------------------------------------------------------------------------*/
 
 static int pa_openauxstream (struct iaxc_audio_driver *d )
 {
