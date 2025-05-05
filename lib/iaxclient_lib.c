@@ -650,10 +650,11 @@ EXPORT int iaxc_initialize(int num_calls)
 	}
     printf("ESTOY IAXC\n");
 
-    if ( openal_initialize(&audio_driver, 8000) )
+    if ( pa_initialize(&audio_driver, 8000) ) // Use PortAudio initialization
     {
-        iaxci_usermsg(IAXC_ERROR, "failed openal_initialize");
-        return -1;
+        iaxci_usermsg(IAXC_ERROR, "failed pa_initialize"); // Update error message
+        OPENAL_LOG("failed pa_initialize\n");
+		return -1;
     }
 #ifdef USE_VIDEO
 	if ( video_initialize() )

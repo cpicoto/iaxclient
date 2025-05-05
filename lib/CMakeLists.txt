@@ -38,8 +38,10 @@ set(IAXCLIENT_BASE_SOURCES
     codec_gsm.c
     codec_ulaw.c
     iaxclient_lib.c
-    audio_openal.c        # use OpenAL backend
-    # audio_portaudio.c    # disabled
+    # audio_openal.c        # disabled
+    audio_portaudio.c    # use PortAudio backend
+    pa_ringbuffer.c      # Add PortAudio ring buffer source
+    portmixer/px_win_wmme/px_win_wmme.c # Add PortMixer Windows MME source
 )
 
 if(WIN32)
@@ -89,20 +91,33 @@ if(ENABLE_SPEEX)
 endif()
 
 #
+# Locate PortAudio library (Locally Built - Installed to /mingw64)
+#
+set(PORTAUDIO_LIBRARY "/mingw64/lib/libportaudio.dll.a" CACHE FILEPATH "Path to locally built PortAudio import library in /mingw64/lib")
+
+if(NOT EXISTS "${PORTAUDIO_LIBRARY}")
+  message(FATAL_ERROR "Locally built PortAudio library not found at specified path: ${PORTAUDIO_LIBRARY}. Please ensure it was installed correctly to /mingw64.")
+else()
+  message(STATUS "Using locally built PortAudio Library: ${PORTAUDIO_LIBRARY}")
+  # The DLL is in /mingw64/bin, which should be in the PATH, so no extra linking steps needed here.
+endif()
+
+#
 # Link libraries
 #
 if(WIN32)
   target_link_libraries(iaxclient_lib
     ${CMAKE_THREAD_LIBS_INIT}
     Ws2_32
-    OpenAL32
+    ${PORTAUDIO_LIBRARY}
+    winmm                 # Add the Windows Multimedia library
     $<$<BOOL:${ENABLE_SPEEX}>:${SPEEXDSP_LIBRARY}>
     $<$<BOOL:${ENABLE_SPEEX}>:${SPEEX_LIBRARY}>
   )
 else()
   target_link_libraries(iaxclient_lib
     ${CMAKE_THREAD_LIBS_INIT}
-    openal
+    ${PORTAUDIO_LIBRARY}  # Changed from openal
     $<$<BOOL:${ENABLE_SPEEX}>:speexdsp>
     $<$<BOOL:${ENABLE_SPEEX}>:speex>
   )

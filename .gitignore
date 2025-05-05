@@ -363,3 +363,12 @@ build/CMakeFiles/Progress/30
 build/CMakeFiles/Progress/31
 build/CMakeFiles/Progress/32
 build/CMakeFiles/Progress/count.txt
+lib/build/CMakeFiles/iaxclient_lib.dir/audio_portaudio.c.obj.d
+lib/build/CMakeFiles/iaxclient_lib.dir/audio_portaudio.c.obj
+lib/build/CMakeFiles/iaxclient_lib.dir/portaudio_utils.c.obj
+lib/build/CMakeFiles/iaxclient_lib.dir/portaudio_utils.c.obj.d
+lib/build/CMakeFiles/iaxclient_lib.dir/pa_ringbuffer.c.obj.d
+lib/build/CMakeFiles/iaxclient_lib.dir/pa_ringbuffer.c.obj
+.gitignore
+lib/build/CMakeFiles/iaxclient_lib.dir/portmixer/px_win_wmme/px_win_wmme.c.obj
+lib/build/CMakeFiles/iaxclient_lib.dir/portmixer/px_win_wmme/px_win_wmme.c.obj.d

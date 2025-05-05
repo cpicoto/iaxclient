@@ -37,6 +37,41 @@
 #include "iaxclient_lib.h"
 #include "portmixer.h"
 
+
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <windows.h>
+  #define PORT_LOG(fmt, ...)                                                    \
+    do {                                                                           \
+      char _buf[512];                                                              \
+      char _time_buf[32];                                                          \
+      SYSTEMTIME _st;                                                              \
+      GetLocalTime(&_st);                                                          \
+      snprintf(_time_buf, sizeof(_time_buf), "%02d:%02d:%02d.%03d",                \
+               _st.wHour, _st.wMinute, _st.wSecond, _st.wMilliseconds);            \
+      _snprintf(_buf, sizeof(_buf), "%s:[portaudio-debug] " fmt "\n",                 \
+               _time_buf, ##__VA_ARGS__);                                          \
+      OutputDebugStringA(_buf);                                                    \
+    } while(0)
+#else
+  #include <time.h>
+  #include <sys/time.h>
+  #define PORT_LOG(fmt, ...)                                                    \
+    do {                                                                           \
+      struct timeval tv;                                                           \
+      struct tm* tm_info;                                                          \
+      char _time_buf[32];                                                          \
+      gettimeofday(&tv, NULL);                                                     \
+      tm_info = localtime(&tv.tv_sec);                                             \
+      strftime(_time_buf, sizeof(_time_buf), "%H:%M:%S", tm_info);                 \
+      char _ms_buf[8];                                                             \
+      snprintf(_ms_buf, sizeof(_ms_buf), ".%03d", (int)(tv.tv_usec / 1000));       \
+      strcat(_time_buf, _ms_buf);                                                  \
+      fprintf(stderr, "[portaudio-debug %s] " fmt "\n", _time_buf, ##__VA_ARGS__);    \
+    } while(0)
+#endif
+
+
 #ifdef USE_MEC2
 #define DO_EC
 #include "mec3.h"
@@ -69,6 +104,7 @@ static int selectedInput, selectedOutput, selectedRing;
 static int sample_rate = 8000;
 static int mixers_initialized;
 
+static int current_audio_format = 0;  // Add this to track audio format
 
 #define MAX_SAMPLE_RATE       48000
 #ifndef MS_PER_FRAME
@@ -180,22 +216,27 @@ static int scan_devices(struct iaxc_audio_driver *d)
 			dev->devID = i;
 			dev->capabilities = 0;
 
-			if ( pa->maxInputChannels > 0 )
+			if ( pa->maxInputChannels > 0 ){
 				dev->capabilities |= IAXC_AD_INPUT;
+				PORT_LOG("IAXC_AD_INPUT: %s", dev->name);
+			}
 
 			if ( pa->maxOutputChannels > 0 )
 			{
 				dev->capabilities |= IAXC_AD_OUTPUT;
 				dev->capabilities |= IAXC_AD_RING;
+				PORT_LOG("IAXC_AD_OUTPUT: %s", dev->name);
 			}
 
-			if ( i == Pa_GetDefaultInputDevice() )
+			if ( i == Pa_GetDefaultInputDevice() ){
 				dev->capabilities |= IAXC_AD_INPUT_DEFAULT;
-
+				PORT_LOG("IAXC_AD_INPUT_DEFAULT: %s", dev->name);
+			}
 			if ( i == Pa_GetDefaultOutputDevice() )
 			{
 				dev->capabilities |= IAXC_AD_OUTPUT_DEFAULT;
 				dev->capabilities |= IAXC_AD_RING_DEFAULT;
+				PORT_LOG("IAXC_AD_OUTPUT_DEFAULT: %s", dev->name);
 			}
 		}
 		else //frik: under Terminal Services
@@ -558,10 +599,15 @@ static int pa_open(int single, int inMono, int outMono)
 	PaError err;
 	PaDeviceInfo *result;
 
+	
+    PORT_LOG("pa_open: single=%d, inMono=%d, outMono=%d", single, inMono, outMono);
+    PORT_LOG("pa_open: selectedInput=%d, selectedOutput=%d", selectedInput, selectedOutput);
+
 	struct PaStreamParameters in_stream_params, out_stream_params, no_device;
 	in_stream_params.device = selectedInput;
 	in_stream_params.channelCount = (inMono ? 1 : 2);
 	in_stream_params.sampleFormat = paInt16;
+    PORT_LOG("Input stream format explicitly set to 0x%x (paInt16)", paInt16);
 	result = (PaDeviceInfo *)Pa_GetDeviceInfo(selectedInput);
 	if ( result == NULL ) return -1;
 	in_stream_params.suggestedLatency = result->defaultLowInputLatency;
@@ -742,10 +788,24 @@ static int pa_openauxstream (struct iaxc_audio_driver *d )
 static int pa_start(struct iaxc_audio_driver *d)
 {
 	static int errcnt = 0;
+	current_audio_format = paInt16;  // Fix for 0x0 format issue
+    PORT_LOG("Explicitly setting audio format to 0x%x (paInt16)", current_audio_format);
 
 	if ( running )
 		return 0;
 
+	// Add format check
+	if (d != NULL) {
+		PORT_LOG("Audio format before start: 0x%x %s", 
+			current_audio_format, 
+			(current_audio_format == 0) ? "INVALID!" : "ok");
+		
+		// Fix zero format if needed
+		if (current_audio_format == 0) {
+			current_audio_format = paInt16;
+			PORT_LOG("Fixed zero format to 0x%x (paInt16)", current_audio_format);
+		}
+	}
 	/* re-open mixers if necessary */
 	if ( iMixer )
 	{
@@ -830,6 +890,7 @@ static int pa_start(struct iaxc_audio_driver *d)
 						Px_GetInputSourceName(iMixer, n)) )
 				{
 					Px_SetCurrentInputSource( iMixer, n );
+					PORT_LOG("Using microphone input source %d", n);
 				}
 			}
 		}
@@ -847,7 +908,7 @@ static int pa_start(struct iaxc_audio_driver *d)
 			pa_input_level_set(d, 0.6f);
 		mixers_initialized = 1;
 	}
-
+    PORT_LOG("Streams started successfully");
 	running = 1;
 	return 0;
 }
@@ -899,20 +960,30 @@ static void handle_paerror(PaError err, char * where)
 
 static int pa_input(struct iaxc_audio_driver *d, void *samples, int *nSamples)
 {
-	int bytestoread;
+    int bytestoread;
+    int available;
 
-	bytestoread = *nSamples * sizeof(SAMPLE);
+    bytestoread = *nSamples * sizeof(SAMPLE);
+    PORT_LOG("pa_input: driver format=0x%x, samples=%p, nSamples=%d", 
+        current_audio_format, samples, *nSamples);
+    
+    /* Check how many bytes are available for reading */
+    available = PaUtil_GetRingBufferReadAvailable(&inRing);
+    
+    /* we don't return partial buffers */
+    if (available < bytestoread)
+    {
+        PORT_LOG("Ring buffer read: available=%d, requested=%d INSUFFICIENT!", 
+            available, bytestoread);
+        *nSamples = 0;
+        return 0;
+    }
 
-	/* we don't return partial buffers */
-	if ( PaUtil_GetRingBufferWriteAvailable(&inRing) < bytestoread )
-	{
-		*nSamples = 0;
-		return 0;
-	}
+    int bytes_read = PaUtil_ReadRingBuffer(&inRing, samples, bytestoread);
+    PORT_LOG("Ring buffer read: available=%d, requested=%d %s", 
+        available, bytestoread, (bytes_read < bytestoread) ? "PARTIAL READ!" : "ok");
 
-	PaUtil_ReadRingBuffer(&inRing, samples, bytestoread);
-
-	return 0;
+    return 0;
 }
 
 static int pa_output(struct iaxc_audio_driver *d, void *samples, int nSamples)
@@ -1081,16 +1152,18 @@ static int _pa_initialize (struct iaxc_audio_driver *d, int sr)
 	PaError  err;
 
 	sample_rate = sr;
-
+    PORT_LOG("Initializing PortAudio with sample rate %d", sr);
 	/* initialize portaudio */
 	if ( paNoError != (err = Pa_Initialize()) )
 	{
+		PORT_LOG("Pa_Initialize failed with error %d: %s", 
+			err, Pa_GetErrorText(err));
 		iaxci_usermsg(IAXC_TEXT_TYPE_ERROR, "Failed Pa_Initialize");
 		return err;
 	}
-
-	/* scan devices */
+    PORT_LOG("Pa_Initialize succeeded, scanning devices");
 	scan_devices(d);
+	PORT_LOG("Found %d audio devices", d->nDevices);
 
 	/* setup methods */
 	d->initialize = pa_initialize;
@@ -1121,7 +1194,7 @@ static int _pa_initialize (struct iaxc_audio_driver *d, int sr)
 	PaUtil_InitializeRingBuffer(&outRing, 1, OUTRBSZ, outRingBuf);
 
 	running = 0;
-
+    PORT_LOG("PortAudio initialization complete");
 	return 0;
 }
 
@@ -1129,7 +1202,10 @@ static int _pa_initialize (struct iaxc_audio_driver *d, int sr)
    also initialize mixers and levels */
 int pa_initialize(struct iaxc_audio_driver *d, int sr)
 {
+	PORT_LOG("pa_initialize: Setting up audio driver with sample rate %d", sr);
 	_pa_initialize(d, sr);
+    current_audio_format = paInt16;  // Fix for 0x0 format issue
+    PORT_LOG("Explicitly setting audio format to 0x%x (paInt16)", current_audio_format);
 
 	/* TODO: Kludge alert. We only do the funny audio start-stop
 	 * business if iaxci_audio_output_mode is not set. This is a
