@@ -104,6 +104,7 @@ static int selectedInput, selectedOutput, selectedRing;
 
 static int sample_rate = 8000;
 static int mixers_initialized;
+static int startup_counter = 0;  // Add this line
 
 static int current_audio_format = 0;  // Add this to track audio format
 static int pa_openwasapi(struct iaxc_audio_driver *d); //AD7NP move to wasapi
@@ -510,8 +511,9 @@ static int pa_callback(
     PaStreamCallbackFlags          statusFlags,
     void                          *userData
 ){
-    const SAMPLE *inBuf  = (const SAMPLE*)inputBuffer;
-    SAMPLE       *outBuf = (SAMPLE*)outputBuffer;
+    const SAMPLE *inBuf = (const SAMPLE*)inputBuffer;
+    SAMPLE *outBuf = (SAMPLE*)outputBuffer;
+    static int debug_counter = 0;
     
     // Skip processing if no input buffer
     if (!inputBuffer) {
@@ -521,24 +523,33 @@ static int pa_callback(
         return paContinue;
     }
     
-    // Simple resampling - just take every Nth sample
-    // This is less CPU intensive than averaging
+    // Simple resampling with more samples per batch
     if (host_sample_rate > sample_rate) {
         int step = (int)sample_ratio;
+        
+        // Create a larger batch to process - we need at least 160 samples per batch
+        static SAMPLE batch_buffer[480]; // 3x160 samples to ensure we have enough
+        static int batch_count = 0;
         int count = 0;
         
         // Pick every Nth sample (decimation)
-        for (unsigned long i = 0; i < hostFrames; i += step) {
-            SAMPLE s = inBuf[i];
-            PaUtil_WriteRingBuffer(&inRing, &s, 1);
+        for (unsigned long i = 0; i < hostFrames && batch_count < 480; i += step) {
+            batch_buffer[batch_count++] = inBuf[i];
             count++;
         }
         
-        // Log occasionally to show progress
-        static int debug_counter = 0;
-        if ((debug_counter++ % 500) == 0) {
-            PORT_LOG("PA_CALLBACK: Resampling %lu host frames to %d (step=%d)", 
-                    hostFrames, count, step);
+        // Only write to ring buffer when we have enough samples
+        if (batch_count >= 120) {  // Lower threshold to 120 for more frequent writes
+            // Write the full batch to the ring buffer
+            int written = PaUtil_WriteRingBuffer(&inRing, batch_buffer, batch_count);
+            
+            if (debug_counter++ % 50 == 0) {
+                PORT_LOG("PA_CALLBACK: Added %d samples to ring buffer (%d written)", 
+                        batch_count, written);
+            }
+            
+            // Reset the batch counter
+            batch_count = 0;
         }
     } else {
         // Direct copy if no resampling needed
@@ -718,47 +729,64 @@ static int pa_openstreams (struct iaxc_audio_driver *d )
 	return 0;
 }
 /*---------------------------------------------------------------------------*/
-/* WASAPI‐specific full‐duplex open */
 static int pa_openwasapi(struct iaxc_audio_driver *d)
 {
     PaError err;
-    /* 1) Find WASAPI host API */
+    
+    // 1) Find WASAPI host API
     PaHostApiIndex apiIndex = Pa_HostApiTypeIdToHostApiIndex(paWASAPI);
     if (apiIndex < 0) {
         PORT_LOG("pa_openwasapi: WASAPI not available");
         return -1;
     }
 
-    /* 2) Get default WASAPI devices */
+    // 2) Get default WASAPI devices (or use selected ones if specified)
     const PaHostApiInfo *apiInfo = Pa_GetHostApiInfo(apiIndex);
-    PaDeviceIndex inDev  = Pa_HostApiDeviceIndexToDeviceIndex(apiIndex,
-                                apiInfo->defaultInputDevice);
-    PaDeviceIndex outDev = Pa_HostApiDeviceIndexToDeviceIndex(apiIndex,
-                                apiInfo->defaultOutputDevice);
+    PaDeviceIndex inDev, outDev;
+    
+    // Use selected devices if they're valid for WASAPI
+    if (selectedInput >= 0 && Pa_GetHostApiInfo(Pa_GetDeviceInfo(selectedInput)->hostApi)->type == paWASAPI) {
+        inDev = selectedInput;
+    } else {
+        inDev = Pa_HostApiDeviceIndexToDeviceIndex(apiIndex, apiInfo->defaultInputDevice);
+    }
+    
+    if (selectedOutput >= 0 && Pa_GetHostApiInfo(Pa_GetDeviceInfo(selectedOutput)->hostApi)->type == paWASAPI) {
+        outDev = selectedOutput;
+    } else {
+        outDev = Pa_HostApiDeviceIndexToDeviceIndex(apiIndex, apiInfo->defaultOutputDevice);
+    }
+    
     if (inDev < 0 || outDev < 0) {
         PORT_LOG("pa_openwasapi: no WASAPI I/O device");
         return -1;
     }
 
-    /* 3) Compute host rate and resample ratio */
+    // 3) Compute host rate and resample ratio
     host_sample_rate = Pa_GetDeviceInfo(inDev)->defaultSampleRate;
-    sample_ratio     = host_sample_rate / (double)sample_rate;
-    PORT_LOG("pa_openwasapi: host rate=%.1f Hz, ratio=%.3f", host_sample_rate, sample_ratio);
+    sample_ratio = host_sample_rate / (double)sample_rate;
+    PORT_LOG("pa_openwasapi: Requested WASAPI to deliver audio at %.1fHz (native rate) with resampling to %d Hz", 
+            host_sample_rate, sample_rate);
 
-    /* 4) Fill WASAPI-specific info */
+    // Fix zero audio format issue
+    if (current_audio_format == 0) {
+        current_audio_format = paInt16;
+        PORT_LOG("pa_openwasapi: Fixed zero format, using paInt16");
+    }
+
+    // 4) Fill WASAPI-specific info
     PaWasapiStreamInfo wasapiInfo = {
         .size           = sizeof(PaWasapiStreamInfo),
         .hostApiType    = paWASAPI,
         .version        = 1,
-        .flags          = paWinWasapiUseChannelMask
-                        | paWinWasapiThreadPriority,
+        .flags          = paWinWasapiAutoConvert | paWinWasapiThreadPriority,
         .threadPriority = eThreadPriorityProAudio,
-        .channelMask    = PAWIN_SPEAKER_FRONT_CENTER,  /* mono */
+        .channelMask    = PAWIN_SPEAKER_FRONT_CENTER,  // mono
         .streamCategory = eAudioCategoryCommunications,
         .streamOption   = eStreamOptionNone
     };
 
-    /* 5) Fill your PortAudio parameters */
+    // 5) Fill your PortAudio parameters
     PaStreamParameters inParams = {
         .device                    = inDev,
         .channelCount              = 1,
@@ -774,29 +802,35 @@ static int pa_openwasapi(struct iaxc_audio_driver *d)
         .hostApiSpecificStreamInfo = &wasapiInfo
     };
 
-    /* 6) Open full-duplex stream at host_sample_rate */
+    // 6) Open full-duplex stream at host_sample_rate
     err = Pa_OpenStream(
         &iStream,
         &inParams,
         &outParams,
-        host_sample_rate,
-        paFramesPerBufferUnspecified,
+        host_sample_rate,  // Use native 48kHz rate
+        1024,  // Explicit buffer size helps with stability
         paNoFlag,
-        (PaStreamCallback *)pa_callback,
+        pa_callback,  // Callback is already set here
         d
     );
+    
     if (err != paNoError) {
         PORT_LOG("pa_openwasapi: Pa_OpenStream failed: %s", Pa_GetErrorText(err));
         return -1;
     }
 
-    /* 7) Use one stream for both in/out */
+    // 7) Use one stream for both in/out
     oneStream = 1;
-    oStream   = iStream;
+    oStream = iStream;
+    
+    // 8) Remove this problematic call
+    // err = Pa_SetStreamCallback(iStream, pa_callback, d);
+    // if (err != paNoError) {
+    //     PORT_LOG("pa_openwasapi: Failed to explicitly set callback: %s", Pa_GetErrorText(err));
+    // }
 
     return 0;
 }
-
 /*---------------------------------------------------------------------------*/
 
 static int pa_openauxstream (struct iaxc_audio_driver *d )
@@ -1032,37 +1066,49 @@ static void handle_paerror(PaError err, char * where)
 
 static int pa_input(struct iaxc_audio_driver *d, void *samples, int *nSamples)
 {
-    int bytestoread;
-    int available;
-    static int startup_counter = 0;
+    static int error_count = 0;
+    static int last_success_time = 0;
+    static int call_count = 0;
+    int elementsToRead = *nSamples;
+    int available = PaUtil_GetRingBufferReadAvailable(&inRing);
     
-    bytestoread = *nSamples * sizeof(SAMPLE);
+    // Reduce log spam by only logging every few calls
+    if (call_count++ % 20 == 0) {
+        PORT_LOG("pa_input: Available=%d elements, requested=%d", available, elementsToRead);
+    }
     
-    /* Check how many bytes are available for reading */
-    available = PaUtil_GetRingBufferReadAvailable(&inRing);
-    
-    /* During startup, be more tolerant of partial buffers */
-    if (available < bytestoread) {
-        if (startup_counter++ < 100) {
-            // During initial startup, return 0 samples instead of error
-            *nSamples = 0;
+    if (available < elementsToRead) {
+        // Return partial data if we have more than half requested
+        if (available > elementsToRead/2) {
+            PORT_LOG("pa_input: Returning partial data (%d elements)", available);
+            PaUtil_ReadRingBuffer(&inRing, samples, available);
+            *nSamples = available;
+            error_count = 0;
             return 0;
         }
         
-        // After startup period, return error code
+        // During startup or after silence
+        if (startup_counter++ < 200) {
+            *nSamples = 0;
+            return 0;  // Return success with 0 samples
+        }
+        
+        // Add small delay to allow buffer to fill if we're getting errors
+        if (++error_count > 5) {
+            error_count = 0;
+            iaxc_millisleep(5);  // Small sleep to allow buffer to fill
+        }
+        
         *nSamples = 0;
-        return 1;
+        return 1;  // Error - not enough data
     }
     
-    // Reset startup counter when we successfully read a buffer
-    startup_counter = 0;
-    
-    /* Read the data from the buffer */
-    PaUtil_ReadRingBuffer(&inRing, samples, bytestoread);
-    
+    // Success - we have enough data
+    PaUtil_ReadRingBuffer(&inRing, samples, elementsToRead);
+    error_count = 0;
+    startup_counter = 0;  // Reset startup counter on success
     return 0;
 }
-
 
 static int pa_output(struct iaxc_audio_driver *d, void *samples, int nSamples)
 {
