@@ -289,7 +289,7 @@ int openal_output(struct iaxc_audio_driver *d, void *samples, int nSamples) {
             int now = GetTickCount();  // Windows specific, use appropriate timer elsewhere
             
             alSourcePlay(priv->source);
-#ifdef NOTQUIET            
+#ifdef VERBOSE            
             // Only log with reasonable frequency
             if (now - last_report > 1000) {  // Once per second max
                 OPENAL_LOG("Source started playing");

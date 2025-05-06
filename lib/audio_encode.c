@@ -261,13 +261,6 @@ static int input_postprocess(void *audio, int len, int rate)
         // Flush to ensure data is written to disk
         fflush(audio_capture_file);
         
-        // Periodically log progress
-        /*
-        if (audio_samples_written % 8000 == 0) { // Log every second of audio
-            AUDIO_LOG("Audio recording progress: %d samples (%.1f seconds)", 
-                    audio_samples_written, audio_samples_written/8000.0f);
-        }
-        */
 	}
 
 	if ( !st || speex_state_size != len || speex_state_rate != rate )

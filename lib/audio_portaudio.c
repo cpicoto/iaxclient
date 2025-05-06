@@ -593,11 +593,13 @@ static int pa_callback(
         
         // Write resampled audio to the ring buffer
         int written = PaUtil_WriteRingBuffer(&inRing, resampled_buffer, out_len);
-        
+#ifdef VERBOSE        
         if (debug_counter % 500 == 0) {
             PORT_LOG("PA_CALLBACK: Resampled %lu frames to %lu frames (%d written to buffer)",
                     hostFrames, (unsigned long)out_len, written);
         }
+#endif
+
     } else {
         // If no resampling needed or no resampler available, use direct copy
         PaUtil_WriteRingBuffer(&inRing, inBuf, hostFrames);
@@ -635,10 +637,11 @@ static int pa_callback(
                                 if (abs_val > max_value) max_value = abs_val;
                             }
                         }
-                        
+                        #ifdef VERBOSE
                         if (has_audio) {
                             PORT_LOG("OUTPUT AUDIO: Active audio data, max amplitude: %d", max_value);
                         }
+						#endif
                     }
                     
                     // Resample from 8kHz to host_sample_rate
@@ -729,7 +732,7 @@ static int pa_open(int single, int inMono, int outMono)
 	in_stream_params.device = selectedInput;
 	in_stream_params.channelCount = (inMono ? 1 : 2);
 	in_stream_params.sampleFormat = paInt16;
-    PORT_LOG("Input stream format explicitly set to 0x%x (paInt16)", paInt16);
+    PORT_LOG("pa_open:Input stream format explicitly set to 0x%x (paInt16)", paInt16);
 	result = (PaDeviceInfo *)Pa_GetDeviceInfo(selectedInput);
 	if ( result == NULL ) return -1;
 	in_stream_params.suggestedLatency = result->defaultLowInputLatency;
@@ -1238,16 +1241,18 @@ static int pa_input(struct iaxc_audio_driver *d, void *samples, int *nSamples)
     static int call_count = 0;
     int elementsToRead = *nSamples;
     int available = PaUtil_GetRingBufferReadAvailable(&inRing);
-    
+#ifdef VERBOSE    
     // Reduce log spam by only logging every few calls
     if (call_count++ % 20 == 0) {
         PORT_LOG("pa_input: Available=%d elements, requested=%d", available, elementsToRead);
     }
-    
+#endif    
     if (available < elementsToRead) {
         // Return partial data if we have more than half requested
         if (available > elementsToRead/2) {
+#ifdef VERBOSE			
             PORT_LOG("pa_input: Returning partial data (%d elements)", available);
+#endif			
             PaUtil_ReadRingBuffer(&inRing, samples, available);
             *nSamples = available;
             error_count = 0;
@@ -1279,56 +1284,24 @@ static int pa_input(struct iaxc_audio_driver *d, void *samples, int *nSamples)
 
 static int pa_output(struct iaxc_audio_driver *d, void *samples, int nSamples)
 {
-    int bytestowrite = nSamples * sizeof(SAMPLE);
-    int outRingLen;
-    static int last_output_log = 0;
-    static int sample_counter = 0;
-    
-    // Analyze audio content occasionally (for debug logging only)
-    if (sample_counter++ % 2000 == 0) {
-        int has_audio = 0;
-        int max_amplitude = 0;
-        
-        // Check first 50 samples for non-zero values
-        for (int i = 0; i < nSamples && i < 50; i++) {
-            int amplitude = abs(((SAMPLE*)samples)[i]);
-            if (amplitude > 0) {
-                has_audio = 1;
-                if (amplitude > max_amplitude)
-                    max_amplitude = amplitude;
-            }
-        }
-        
-        if (has_audio) {
-            PORT_LOG("AUDIO DETECTED: Max amplitude %d in incoming network audio", max_amplitude);
-        }
-    }
-    
     // Get ring buffer metrics
-    outRingLen = PaUtil_GetRingBufferWriteAvailable(&outRing);
+    int outRingLen = PaUtil_GetRingBufferWriteAvailable(&outRing);
     outRingLenAvg = (outRingLenAvg * 9 + outRingLen) / 10;
-
-    // Debug log less frequently
-    if (last_output_log++ % 500 == 0) {
-        PORT_LOG("OUTPUT: Writing %d samples to buffer (space: %d/%d)", 
-                nSamples, outRingLen, OUTRBSZ);
-    }
     
-    // Buffer management - simplified to avoid unnecessary frame drops
-    if (output_underruns > 0) {
-        // We've had underruns recently, never drop frames
-        output_underruns = 0; // Reset the counter
-    } else if (outRingLen < nSamples) {
-        // Not enough space - this is rare but possible
-        PORT_LOG("OUTPUT OVERFLOW: Need %d bytes, only %d available", nSamples, outRingLen);
+    // Simple buffer management - only drop if absolutely necessary
+    if (outRingLen < nSamples) {
+        // This is a buffer overflow situation - log it
+        PORT_LOG("OUTPUT DROP: Buffer overflow (%d samples needed, only %d available)", 
+                nSamples, outRingLen);
         return 0;
     }
     
     // Write the data to the ring buffer
     int written = PaUtil_WriteRingBuffer(&outRing, samples, nSamples);
     
+    // Log any partial writes
     if (written < nSamples) {
-        PORT_LOG("WARNING: Could only write %d of %d samples", written, nSamples);
+        PORT_LOG("OUTPUT DROP: Could only write %d of %d samples", written, nSamples);
     }
     
     return written;

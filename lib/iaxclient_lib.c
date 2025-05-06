@@ -1031,6 +1031,8 @@ static void generate_netstat_event(int callNo)
 		iaxci_post_event(ev);
 }
 
+// Add this function implementation somewhere before it's referenced:
+
 static void handle_audio_event(struct iax_event *e, int callNo)
 {
 	int total_consumed = 0;
@@ -1156,7 +1158,7 @@ static int iax_send_lagrp(struct iax_session *session, unsigned int ts);
 /* ------------------------------------------------------------------ */
 static void iaxc_handle_network_event(struct iax_event *e, int callNo)
 {
-#ifdef NOTQUIET	
+#ifdef VERBOSE 	
     IAX_LOG("Network Event received explicitly: etype=%d, callNo=%d",
                e->etype, callNo);
 #endif
@@ -1230,7 +1232,7 @@ static void iaxc_handle_network_event(struct iax_event *e, int callNo)
     /* -----------  FIXED TEXT-EVENT HANDLER  ------------------- */
     case IAX_EVENT_TEXT:
     {
-#ifdef NOTQUIET			
+#ifdef VERBOSE			
         IAX_LOG("IAX_EVENT_TEXT explicitly received (callNo=%d)", callNo);
 #endif
         if (e->data && e->datalen > 0) {
