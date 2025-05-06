@@ -90,18 +90,45 @@ if(ENABLE_SPEEX)
   add_definitions(-DHAVE_SPEEX_DSP)
 endif()
 
-# Find the PortAudio static library
-find_library(PORTAUDIO_LIBRARY
-  NAMES portaudio
-  HINTS "/mingw64/lib"
-  DOC "Path to PortAudio static library"
-)
-
-if (NOT PORTAUDIO_LIBRARY)
-  message(FATAL_ERROR
-    "Could not find PortAudio static library in /mingw64/lib")
+# For MSYS2, convert the path correctly
+if(DEFINED ENV{MINGW_PREFIX})
+  set(MINGW_PATH $ENV{MINGW_PREFIX})
 else()
-  message(STATUS "Found PortAudio static library: ${PORTAUDIO_LIBRARY}")
+  # Fallback if MINGW_PREFIX isn't defined
+  set(MINGW_PATH "C:/msys64/mingw64")
+endif()
+
+# Use native path with CMake
+file(TO_CMAKE_PATH "${MINGW_PATH}/lib/libportaudio.a" PORTAUDIO_LIBRARY_PATH)
+
+# Set the PortAudio library path
+set(PORTAUDIO_LIBRARY "${PORTAUDIO_LIBRARY_PATH}" CACHE FILEPATH "Path to PortAudio static library")
+
+# Add debugging output
+message(STATUS "Looking for PortAudio static library at: ${PORTAUDIO_LIBRARY}")
+if(EXISTS "${PORTAUDIO_LIBRARY}")
+  message(STATUS "Found PortAudio static library!")
+else()
+  # Try alternative path formats
+  message(STATUS "PortAudio library not found at ${PORTAUDIO_LIBRARY}, trying alternatives...")
+  
+  # Try with direct MSYS2 path
+  set(PORTAUDIO_LIBRARY "C:/msys64/mingw64/lib/libportaudio.a" CACHE FILEPATH "Path to PortAudio static library" FORCE)
+  
+  if(EXISTS "${PORTAUDIO_LIBRARY}")
+    message(STATUS "Found PortAudio static library at alternative path: ${PORTAUDIO_LIBRARY}")
+  else()
+    message(FATAL_ERROR "PortAudio static library not found. Verify the file exists and is accessible.")
+  endif()
+endif()
+
+# Add additional libraries needed for static linking with PortAudio
+if(WIN32)
+    set(PLATFORM_LIBS ${PLATFORM_LIBS} 
+      setupapi
+      ole32
+      uuid
+    )
 endif()
 
 # Add setupapi to the linked libraries
