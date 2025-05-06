@@ -80,22 +80,37 @@ find_package(Threads REQUIRED)
 # Locate Speex libs if requested
 #
 if(ENABLE_SPEEX)
-  find_library(SPEEX_LIBRARY    speex    HINTS /mingw64/lib)
-  find_library(SPEEXDSP_LIBRARY speexdsp HINTS /mingw64/lib)
-  if(NOT SPEEX_LIBRARY OR NOT SPEEXDSP_LIBRARY)
-    message(FATAL_ERROR "ENABLE_SPEEX=ON but libspeex or libspeexdsp not found! Install the MSYS2 speex and speexdsp packages.")
+  # For MSYS2, get paths for static Speex libraries
+  if(DEFINED ENV{MINGW_PREFIX})
+    set(SPEEX_PATH $ENV{MINGW_PREFIX})
+  else()
+    set(SPEEX_PATH "C:/msys64/mingw64")
   endif()
+
+  # Convert to CMake paths
+  file(TO_CMAKE_PATH "${SPEEX_PATH}/lib/libspeex.a" SPEEX_LIBRARY_PATH)
+  file(TO_CMAKE_PATH "${SPEEX_PATH}/lib/libspeexdsp.a" SPEEXDSP_LIBRARY_PATH)
+
+  # Set the library paths
+  set(SPEEX_LIBRARY "${SPEEX_LIBRARY_PATH}" CACHE FILEPATH "Path to Speex static library")
+  set(SPEEXDSP_LIBRARY "${SPEEXDSP_LIBRARY_PATH}" CACHE FILEPATH "Path to SpeexDSP static library")
+
+  # Check if libraries exist
+  if(NOT EXISTS "${SPEEX_LIBRARY}" OR NOT EXISTS "${SPEEXDSP_LIBRARY}")
+    # Try alternative paths
+    set(SPEEX_LIBRARY "C:/msys64/mingw64/lib/libspeex.a" CACHE FILEPATH "Path to Speex static library" FORCE)
+    set(SPEEXDSP_LIBRARY "C:/msys64/mingw64/lib/libspeexdsp.a" CACHE FILEPATH "Path to SpeexDSP static library" FORCE)
+    
+    if(NOT EXISTS "${SPEEX_LIBRARY}" OR NOT EXISTS "${SPEEXDSP_LIBRARY}")
+      message(FATAL_ERROR "Speex static libraries not found. Make sure libspeex-devel and libspeexdsp-devel packages are installed.")
+    endif()
+  endif()
+  
+  message(STATUS "Using Speex static library: ${SPEEX_LIBRARY}")
+  message(STATUS "Using SpeexDSP static library: ${SPEEXDSP_LIBRARY}")
   
   # Add this line to define HAVE_SPEEX_DSP when Speex is enabled
   add_definitions(-DHAVE_SPEEX_DSP)
-endif()
-
-# For MSYS2, convert the path correctly
-if(DEFINED ENV{MINGW_PREFIX})
-  set(MINGW_PATH $ENV{MINGW_PREFIX})
-else()
-  # Fallback if MINGW_PREFIX isn't defined
-  set(MINGW_PATH "C:/msys64/mingw64")
 endif()
 
 # Use native path with CMake
