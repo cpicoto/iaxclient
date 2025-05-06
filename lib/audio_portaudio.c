@@ -132,7 +132,7 @@ static int output_samples_played = 0;
 
 /* RingBuffer Size; Needs to be Pow(2), 1024 = 512 samples = 64ms */
 #ifndef OUTRBSZ
-# define OUTRBSZ (8192)
+# define OUTRBSZ (32768)
 #endif
 
 /* Input ringbuffer size;  this doesn't seem to be as critical, and making it big
@@ -558,13 +558,14 @@ static int pa_callback(
     SAMPLE *outBuf = (SAMPLE*)outputBuffer;
     static int debug_counter = 0;
     
-    // Skip processing if no input buffer
+    // Skip processing if no input buffer but still clear output buffer
     if (!inputBuffer) {
         if (outputBuffer) {
             memset(outBuf, 0, hostFrames * sizeof(SAMPLE));
         }
         return paContinue;
     }
+    
     // *** INPUT PROCESSING (CAPTURE) ***
     // Use Speex resampler if we have different sample rates
     if (speex_resampler && host_sample_rate > sample_rate) {
@@ -578,7 +579,6 @@ static int pa_callback(
         // Make sure we don't exceed our buffer size
         if (out_len > 2048) {
             out_len = 2048;
-            PORT_LOG("Warning: Limiting resampler output size to 2048 samples");
         }
         
         // Process audio through the resampler
@@ -591,14 +591,10 @@ static int pa_callback(
             &out_len
         );
         
-        if (err != RESAMPLER_ERR_SUCCESS) {
-            PORT_LOG("Speex resampling error: %s", speex_resampler_strerror(err));
-        }
-        
         // Write resampled audio to the ring buffer
         int written = PaUtil_WriteRingBuffer(&inRing, resampled_buffer, out_len);
         
-        if (debug_counter % 100 == 0) {
+        if (debug_counter % 500 == 0) {
             PORT_LOG("PA_CALLBACK: Resampled %lu frames to %lu frames (%d written to buffer)",
                     hostFrames, (unsigned long)out_len, written);
         }
@@ -610,7 +606,7 @@ static int pa_callback(
     // *** OUTPUT PROCESSING (PLAYBACK) ***
     if (outputBuffer) {
         if (output_resampler && host_sample_rate > sample_rate) {
-            // Calculate how many 8kHz samples we need to produce the required hostFrames
+            // Calculate how many 8kHz samples we need for the required hostFrames
             int samples_needed = (int)(hostFrames / sample_ratio);
             
             // Intermediate buffer for 8kHz audio
@@ -619,49 +615,33 @@ static int pa_callback(
             // Check how many samples are available in the output ring buffer
             int available = PaUtil_GetRingBufferReadAvailable(&outRing);
             
-            // Track output buffer status
-            if (available != last_output_buf_size && debug_counter % 100 == 0) {
-                PORT_LOG("OUTPUT BUFFER: %d samples available (need ~%d)", 
-                        available, samples_needed);
-                last_output_buf_size = available;
-            }
-            
-            // If we have at least some samples
             if (available > 0) {
                 // Read up to samples_needed or what's available
                 int samples_to_read = (available > samples_needed) ? samples_needed : available;
                 
                 // Read 8kHz data from ring buffer
                 int actually_read = PaUtil_ReadRingBuffer(&outRing, buffer_8k, samples_to_read);
-                if (actually_read > 0) 
-					debug_check_output_audio(buffer_8k, actually_read);
-				// Check for audio pattern in samples read
-				int has_audio = 0;
-				int max_value = 0;
-				for (int i = 0; i < actually_read && i < 50; i++) {
-					if (buffer_8k[i] != 0) {
-						has_audio = 1;
-						int abs_val = abs(buffer_8k[i]);
-						if (abs_val > max_value) max_value = abs_val;
-					}
-				}
-				
-				if (debug_counter % 200 == 0) {
-					if (has_audio) {
-						PORT_LOG("OUTPUT AUDIO: Non-zero audio detected, max amplitude: %d", max_value);
-					} else if (actually_read > 0) {
-						PORT_LOG("OUTPUT AUDIO: All zeros in buffer (%d samples)", actually_read);
-					}
-				}					
-                if (actually_read != samples_to_read && debug_counter % 100 == 0) {
-                    PORT_LOG("OUTPUT READ MISMATCH: requested %d, got %d samples", 
-                            samples_to_read, actually_read);
-                }
                 
-                output_samples_played += actually_read;
-                
-                // Resample from 8kHz to host_sample_rate
                 if (actually_read > 0) {
+                    // Check for audio content (debugging only)
+                    if (debug_counter % 500 == 0) {
+                        int has_audio = 0;
+                        int max_value = 0;
+                        
+                        for (int i = 0; i < actually_read && i < 50; i++) {
+                            if (buffer_8k[i] != 0) {
+                                has_audio = 1;
+                                int abs_val = abs(buffer_8k[i]);
+                                if (abs_val > max_value) max_value = abs_val;
+                            }
+                        }
+                        
+                        if (has_audio) {
+                            PORT_LOG("OUTPUT AUDIO: Active audio data, max amplitude: %d", max_value);
+                        }
+                    }
+                    
+                    // Resample from 8kHz to host_sample_rate
                     spx_uint32_t in_len = actually_read;
                     spx_uint32_t out_len = hostFrames;
                     
@@ -679,12 +659,9 @@ static int pa_callback(
                         memset(outBuf + out_len, 0, (hostFrames - out_len) * sizeof(SAMPLE));
                     }
                     
-                    if (debug_counter % 200 == 0) {
-                        PORT_LOG("OUTPUT: Read %d samples, resampled to %lu frames, total played: %d", 
-                                actually_read, out_len, output_samples_played);
-                    }
+                    output_samples_played += actually_read;
                 } else {
-                    // Zero samples read, output silence
+                    // No samples read, output silence
                     memset(outBuf, 0, hostFrames * sizeof(SAMPLE));
                 }
             } else {
@@ -696,22 +673,22 @@ static int pa_callback(
                 }
                 memset(outBuf, 0, hostFrames * sizeof(SAMPLE));
             }
-        } else if (outputBuffer) {
-            // Original simple zero-order hold code when no resampler
+        } else {
+            // Legacy path for when no resampler is available
             int samples_read = 0;
+            memset(outBuf, 0, hostFrames * sizeof(SAMPLE));
+            
             for (unsigned long j = 0; j < hostFrames; ++j) {
                 SAMPLE outS = 0;
                 if (j % (int)sample_ratio == 0) {
                     if (PaUtil_ReadRingBuffer(&outRing, &outS, 1) == 1) {
                         samples_read++;
-                    } else {
-                        outS = 0;
                     }
                 }
                 outBuf[j] = outS;
             }
             
-            if (debug_counter % 200 == 0) {
+            if (debug_counter % 500 == 0) {
                 PORT_LOG("LEGACY OUTPUT: Read %d samples for %lu frames", 
                         samples_read, hostFrames);
             }
@@ -1387,9 +1364,6 @@ static int pa_selected_devices(struct iaxc_audio_driver *d, int *input,
 	return 0;
 }
 
-void pa_debug_call_ended() {
-    stop_debug_wav_recording();
-}
 
 static int pa_destroy(struct iaxc_audio_driver *d)
 {

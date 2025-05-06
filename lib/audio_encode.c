@@ -432,7 +432,7 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
         ptt_active = 1;
         // Set input level for better audio during PTT
         iaxc_input_level_set(0.8f);
-        AUDIO_LOG("PTT active: BYPASSING SILENCE DETECTION");
+        //AUDIO_LOG("PTT active: BYPASSING SILENCE DETECTION");
     } else {
         // Only do normal silence detection when PTT is not active
         silent = input_postprocess(data, insize, 8000);
@@ -464,7 +464,7 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
         call->encoder->destroy(call->encoder);
         call->encoder = NULL;
     }
-    AUDIO_LOG("Currently using format: 0x%x (must be not zero)", format);
+    //AUDIO_LOG("Currently using format: 0x%x (must be not zero)", format);
     /* just break early if there's no format defined: this happens for the
      * first couple of frames of new calls */
     if(format == 0) return 0;
@@ -496,12 +496,12 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
 
     // Send the encoded audio data back to the app if required
     if (iaxc_get_audio_prefs() & IAXC_AUDIO_PREF_RECV_LOCAL_ENCODED) {
-        AUDIO_LOG("Sending local encoded audio back to app (size=%d)", outsize);
+        //AUDIO_LOG("Sending local encoded audio back to app (size=%d)", outsize);
         iaxci_do_audio_callback(callNo, 0, IAXC_SOURCE_LOCAL, 1,
                 call->encoder->format & IAXC_AUDIO_FORMAT_MASK,
                 sizeof(outbuf) - outsize, outbuf);
     } else {
-        AUDIO_LOG("Not sending local encoded audio back to app (not enabled)");
+        //AUDIO_LOG("Not sending local encoded audio back to app (not enabled)");
     }
 
     // Always send voice data regardless of callback preferences
@@ -512,7 +512,7 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
         AUDIO_LOG("Failed to send voice! %s\n", iax_errstr);
         return -1;
     } else {
-        AUDIO_LOG("Sent %d bytes of encoded audio data", sizeof(outbuf) - outsize);
+        //AUDIO_LOG("Sent %d bytes of encoded audio data", sizeof(outbuf) - outsize);
     }
 
     return 0;
