@@ -804,14 +804,17 @@ EXPORT void iaxc_ptt_audio_capture_stop(void) {
  */
 EXPORT void iaxc_handle_audio_event(const char* message) {
     if (!message) return;
-    
+#ifdef SAVE_LOCAL_AUDIO    
     if (strcmp(message, "Radio key pressed") == 0) {
         iaxc_ptt_audio_capture_start();
-        fprintf(stderr, "Started audio recording on PTT press\n");
+        AUDIO_LOG("Starting audio recording on PTT press");        
     } else if (strcmp(message, "Radio key released") == 0) {
         iaxc_ptt_audio_capture_stop();
-        fprintf(stderr, "Stopped audio recording on PTT release\n");
+        AUDIO_LOG("Stopping audio recording on PTT release");        
     }
+#else
+    AUDIO_LOG("PTT audio recordings are disabled in this build. No action taken.");    
+#endif    
 }
 
 void test_send_reference_tone(struct iaxc_call *call, int callNo) {

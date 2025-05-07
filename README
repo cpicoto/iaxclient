@@ -51,9 +51,12 @@ cd ~/iaxclient/lib/build
 
 rm -rf CMakeCache.txt CMakeFiles
 
-*DEBUG*
+- DEBUG
 cd ~/iaxclient/lib/build
 cmake -G "MinGW Makefiles"   -DCMAKE_BUILD_TYPE=Debug   -DENABLE_SPEEX=ON   -DCMAKE_C_FLAGS="-g -O0"  ..
+
+- Release
+cmake -G "MinGW Makefiles"   -DENABLE_SPEEX=ON  ..
 
 mingw32-make -j$(nproc)
 
