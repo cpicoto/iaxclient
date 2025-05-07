@@ -372,3 +372,9 @@ lib/build/CMakeFiles/iaxclient_lib.dir/pa_ringbuffer.c.obj
 .gitignore
 lib/build/CMakeFiles/iaxclient_lib.dir/portmixer/px_win_wmme/px_win_wmme.c.obj
 lib/build/CMakeFiles/iaxclient_lib.dir/portmixer/px_win_wmme/px_win_wmme.c.obj.d
+lib/build/CMakeFiles/3.31.5/CMakeCCompiler.cmake
+lib/build/CMakeFiles/3.31.5/CMakeDetermineCompilerABI_C.bin
+lib/build/CMakeFiles/3.31.5/CMakeRCCompiler.cmake
+lib/build/CMakeFiles/3.31.5/CMakeSystem.cmake
+lib/build/CMakeFiles/3.31.5/CompilerIdC/a.exe
+lib/build/CMakeFiles/3.31.5/CompilerIdC/CMakeCCompilerId.c

@@ -3,11 +3,19 @@ BUILDING THE LIBRARY for 64bits: (tested Windows 11 with MSYS2)
 2025/5/5 AD7NP (cpicoto@hotmail.com)
 
 
-Requirements:
-- Install MSYS2
+# Requirements:
+- Install MSYS2 from https://www.msys2.org
+- Open MSYS2 MinGW 64-bit 
 
-..
-..
+# For base dev tools
+pacman -S base-devel
+
+# For CMake (MinGW version)
+pacman -S mingw-w64-x86_64-cmake
+
+# For GCC and make (MinGW 64-bit)
+pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-make
+
 -----------------------------------------------------------------------
 - Install Portaudio Dependencies
 pacman -Syu                           # update packages
@@ -17,14 +25,7 @@ pacman -S --needed base-devel git mingw-w64-x86_64-toolchain mingw-w64-x86_64-cm
 cd ~
 git clone https://github.com/PortAudio/portaudio.git
 
-cd ~
-cd portaudio
-./configure \
-  --prefix=/mingw64 \
-  --disable-shared \
-  CFLAGS="-g -O0"
-make -j$(nproc)
-make install
+
 
 * Better 
 cd ~
@@ -54,6 +55,9 @@ rm -rf CMakeCache.txt CMakeFiles
 *DEBUG*
 cd ~/iaxclient/lib/build
 cmake -G "MinGW Makefiles"   -DCMAKE_BUILD_TYPE=Debug   -DENABLE_SPEEX=ON   -DCMAKE_C_FLAGS="-g -O0"  ..
+
+*RELEASE*
+cmake -G "MinGW Makefiles"   -DENABLE_SPEEX=ON ..
 
 mingw32-make -j$(nproc)
 
