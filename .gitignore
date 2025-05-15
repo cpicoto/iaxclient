@@ -378,3 +378,4 @@ lib/build/CMakeFiles/3.31.5/CMakeRCCompiler.cmake
 lib/build/CMakeFiles/3.31.5/CMakeSystem.cmake
 lib/build/CMakeFiles/3.31.5/CompilerIdC/a.exe
 lib/build/CMakeFiles/3.31.5/CompilerIdC/CMakeCCompilerId.c
+lib/audio_encode.c
