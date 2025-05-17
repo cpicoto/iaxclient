@@ -25,6 +25,7 @@
  *
  */
 
+
 #if defined(WIN32)  ||  defined(_WIN32_WCE)
 #include <stdlib.h>
 #define strcasecmp _stricmp
@@ -232,25 +233,25 @@ static int scan_devices(struct iaxc_audio_driver *d)
 
 			if ( pa->maxInputChannels > 0 ){
 				dev->capabilities |= IAXC_AD_INPUT;
-				PORT_LOG("IAXC_AD_INPUT: %s", dev->name);
+				PORT_LOG("scan_devices:IAXC_AD_INPUT: %s", dev->name);
 			}
 
 			if ( pa->maxOutputChannels > 0 )
 			{
 				dev->capabilities |= IAXC_AD_OUTPUT;
 				dev->capabilities |= IAXC_AD_RING;
-				PORT_LOG("IAXC_AD_OUTPUT: %s", dev->name);
+				PORT_LOG("scan_devices:IAXC_AD_OUTPUT: %s", dev->name);
 			}
 
 			if ( i == Pa_GetDefaultInputDevice() ){
 				dev->capabilities |= IAXC_AD_INPUT_DEFAULT;
-				PORT_LOG("IAXC_AD_INPUT_DEFAULT: %s", dev->name);
+				PORT_LOG("scan_devices:IAXC_AD_INPUT_DEFAULT: %s", dev->name);
 			}
 			if ( i == Pa_GetDefaultOutputDevice() )
 			{
 				dev->capabilities |= IAXC_AD_OUTPUT_DEFAULT;
 				dev->capabilities |= IAXC_AD_RING_DEFAULT;
-				PORT_LOG("IAXC_AD_OUTPUT_DEFAULT: %s", dev->name);
+				PORT_LOG("scan_devices:IAXC_AD_OUTPUT_DEFAULT: %s", dev->name);
 			}
 		}
 		else //frik: under Terminal Services
@@ -536,9 +537,9 @@ static void debug_check_output_audio(const SAMPLE* buf, int len) {
     // Report every 200 frames or when we have 50 consecutive zero frames
     if (total_frames - last_report > 200 || zero_frames > 50) {
         if (all_zeros) {
-            PORT_LOG("OUTPUT AUDIO: %d consecutive silent frames", zero_frames);
+            PORT_LOG("debug_check_output_audio:OUTPUT AUDIO: %d consecutive silent frames", zero_frames);
         } else {
-            PORT_LOG("OUTPUT AUDIO: Active audio data detected [%d, %d, %d, %d]", 
+            PORT_LOG("debug_check_output_audio:OUTPUT AUDIO: Active audio data detected [%d, %d, %d, %d]", 
                     buf[0], buf[1], buf[2], buf[3]);
         }
         last_report = total_frames;
@@ -637,11 +638,11 @@ static int pa_callback(
                                 if (abs_val > max_value) max_value = abs_val;
                             }
                         }
-                        #ifdef VERBOSE
+#ifdef VERBOSE
                         if (has_audio) {
-                            PORT_LOG("OUTPUT AUDIO: Active audio data, max amplitude: %d", max_value);
+                            PORT_LOG("pa_callback:OUTPUT AUDIO: Active audio data, max amplitude: %d", max_value);
                         }
-						#endif
+#endif
                     }
                     
                     // Resample from 8kHz to host_sample_rate
@@ -671,7 +672,7 @@ static int pa_callback(
                 // No samples available
                 output_underruns++;
                 if (output_underruns % 100 == 0) {
-                    PORT_LOG("OUTPUT UNDERRUN (%d): No data available for audio output", 
+                    PORT_LOG("pa_callback:OUTPUT UNDERRUN (%d): No data available for audio output", 
                             output_underruns);
                 }
                 memset(outBuf, 0, hostFrames * sizeof(SAMPLE));
@@ -692,7 +693,7 @@ static int pa_callback(
             }
             
             if (debug_counter % 500 == 0) {
-                PORT_LOG("LEGACY OUTPUT: Read %d samples for %lu frames", 
+                PORT_LOG("pa_callback:LEGACY OUTPUT: Read %d samples for %lu frames", 
                         samples_read, hostFrames);
             }
         }
@@ -855,7 +856,7 @@ static int pa_openstreams (struct iaxc_audio_driver *d )
 	if (err)
 	{
 		handle_paerror(err, "Unable to open streams");
-		PORT_LOG("Unable to open streams: %d", err);
+		PORT_LOG("pa_openstreams:Unable to open streams: %d", err);
 		return -1;
 	}
 	return 0;
@@ -935,11 +936,11 @@ static int pa_openwasapi(struct iaxc_audio_driver *d)
         );
         
         if (err_in != RESAMPLER_ERR_SUCCESS || err_out != RESAMPLER_ERR_SUCCESS) {
-            PORT_LOG("Failed to initialize Speex resamplers: in=%s, out=%s", 
+            PORT_LOG("pa_openwasapi:Failed to initialize Speex resamplers: in=%s, out=%s", 
                     speex_resampler_strerror(err_in),
                     speex_resampler_strerror(err_out));
         } else {
-            PORT_LOG("Speex resampler initialized: %d Hz ↔ %d Hz", 
+            PORT_LOG("pa_openwasapi:Speex resampler initialized: %d Hz ↔ %d Hz", 
                     (int)host_sample_rate, sample_rate);
         }
     }
@@ -1458,18 +1459,24 @@ static int _pa_initialize (struct iaxc_audio_driver *d, int sr)
 	PaError  err;
 
 	sample_rate = sr;
-    PORT_LOG("Initializing PortAudio with sample rate %d", sr);
+#ifdef VERBOSE
+    PORT_LOG("_pa_initialize:Initializing PortAudio with sample rate %d", sr);
+#endif
 	/* initialize portaudio */
 	if ( paNoError != (err = Pa_Initialize()) )
 	{
-		PORT_LOG("Pa_Initialize failed with error %d: %s", 
+		PORT_LOG("_pa_initialize:Pa_Initialize failed with error %d: %s", 
 			err, Pa_GetErrorText(err));
 		iaxci_usermsg(IAXC_TEXT_TYPE_ERROR, "Failed Pa_Initialize");
 		return err;
 	}
-    PORT_LOG("Pa_Initialize succeeded, scanning devices");
+#ifdef VERBOSE
+    PORT_LOG("_pa_initialize:Pa_Initialize succeeded, scanning devices");
+#endif
 	scan_devices(d);
-	PORT_LOG("Found %d audio devices", d->nDevices);
+#ifdef VERBOSE
+	PORT_LOG("_pa_initialize:Found %d audio devices", d->nDevices);
+#endif
 
 	/* setup methods */
 	d->initialize = pa_initialize;
@@ -1505,12 +1512,16 @@ static int _pa_initialize (struct iaxc_audio_driver *d, int sr)
 	// Add some silence at the beginning to prime the buffer
 	SAMPLE silence[160] = {0};
 	PaUtil_WriteRingBuffer(&outRing, silence, 160);
+#ifdef VERBOSE
+	PORT_LOG("_pa_initialize:Ring buffers initialized (in: %d, out: %d)",
 
-	PORT_LOG("Ring buffers initialized (in: %d, out: %d)", 
 		PaUtil_GetRingBufferReadAvailable(&inRing),
 		PaUtil_GetRingBufferReadAvailable(&outRing));
+#endif
 	running = 0;
-    PORT_LOG("PortAudio initialization complete");
+#ifdef VERBOSE
+    PORT_LOG("_pa_initialize:PortAudio initialization complete");
+#endif
 	return 0;
 }
 

@@ -8,7 +8,9 @@ add_definitions(-DBUILDING_DLL           # export symbols in DLL
                 -DLIBIAX                 # IAX interior defs
                 -DCODEC_GSM              # enable the G.SM codec
                 -DHAS_STRING_H           # some older platforms
-                -DHAS_STDLIB_H)
+                -DHAS_STDLIB_H
+                #-DVERBOSE
+		-DSPEEX_PREPROCESS_GET_AGC_LOUDNESS)
 
 if(APPLE)
   add_definitions(-DMACOSX)
