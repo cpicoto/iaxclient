@@ -373,3 +373,4 @@ lib/build/CMakeFiles/iaxclient_lib.dir/pa_ringbuffer.c.obj
 lib/build/CMakeFiles/iaxclient_lib.dir/portmixer/px_win_wmme/px_win_wmme.c.obj
 lib/build/CMakeFiles/iaxclient_lib.dir/portmixer/px_win_wmme/px_win_wmme.c.obj.d
 build/libiaxclient.dll.a
+/.vs
