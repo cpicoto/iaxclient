@@ -127,10 +127,13 @@ static struct iaxc_speex_settings speex_settings =
 	0,    /* abr */
 	3     /* complexity */
 };
+static SpeexPreprocessState* st_small = NULL;  // For ~85 sample buffers
+static SpeexPreprocessState* st_large = NULL;  // For 160 sample buffers
 
 /* Forward declarations for PTT filter functions */
 EXPORT void iaxc_ptt_filters_disable(void);
 EXPORT void iaxc_ptt_filters_restore(void);
+static void set_speex_filters_for_state(SpeexPreprocessState* state);
 
 static float vol_to_db(float vol)
 {
@@ -172,7 +175,11 @@ static int do_level_callback()
 static void set_speex_filters()
 {
 	int i;
-
+    if (st_small)
+        set_speex_filters_for_state(st_small);
+    if (st_large)
+        set_speex_filters_for_state(st_large);
+    return;
 	if ( !st )
 		return;
 
@@ -209,12 +216,31 @@ static void calculate_level(short *audio, int len, float *level)
 	*level += ((float)big_sample / 32767.0f - *level) / 5.0f;
 }
 
+// Modified to accept a specific preprocessor state
+static void set_speex_filters_for_state(SpeexPreprocessState* state)
+{
+    if (!state) return;
+
+    int i;
+    i = 1; /* always make VAD decision */
+    speex_preprocess_ctl(state, SPEEX_PREPROCESS_SET_VAD, &i);
+    i = (iaxci_filters & IAXC_FILTER_AGC) ? 1 : 0;
+    speex_preprocess_ctl(state, SPEEX_PREPROCESS_SET_AGC, &i);
+    i = (iaxci_filters & IAXC_FILTER_DENOISE) ? 1 : 0;
+    speex_preprocess_ctl(state, SPEEX_PREPROCESS_SET_DENOISE, &i);
+
+    i = 35;
+    speex_preprocess_ctl(state, SPEEX_PREPROCESS_SET_PROB_START, &i);
+    i = 20;
+    speex_preprocess_ctl(state, SPEEX_PREPROCESS_SET_PROB_CONTINUE, &i);
+}
 
 static int input_postprocess(void *audio, int len, int rate)
 {
 	static int frame_count = 0;
     frame_count++;
-
+    // Choose appropriate preprocessor state based on buffer size
+    SpeexPreprocessState** active_st;
 
     // Print first few samples for inspection
     short *samples = (short *)audio;
@@ -225,7 +251,7 @@ static int input_postprocess(void *audio, int len, int rate)
 	static float lowest_volume = 1.0f;
 	float volume;
 	int silent = 0;
-
+#ifdef SAVE_LOCAL_AUDIO
 	// Update the sample rate for WAV file creation
 	audio_capture_sample_rate = rate;
 	
@@ -253,7 +279,7 @@ static int input_postprocess(void *audio, int len, int rate)
         // Write raw PCM data
         size_t written = fwrite(audio, sizeof(short), len, audio_capture_file);
         if (written != len) {
-            AUDIO_LOG("WARNING: Failed to write all audio data: %zu/%d written", written, len);
+            AUDIO_LOG("input_postprocess:WARNING: Failed to write all audio data: %zu/%d written", written, len);
         }
         audio_samples_written += len;
         audio_capture_frame_count++;
@@ -262,7 +288,31 @@ static int input_postprocess(void *audio, int len, int rate)
         fflush(audio_capture_file);
         
 	}
-
+#endif
+    // Use different preprocessor instances based on frame size category
+    if (len < 100) {
+        // Small frame (~85 samples)
+        active_st = &st_small;
+        if (!*active_st) {
+            *active_st = speex_preprocess_state_init(len, rate);
+            speex_state_size = len;  // Keep track for debugging only
+            speex_state_rate = rate;
+            set_speex_filters_for_state(*active_st);
+            AUDIO_LOG("Created small-frame preprocessor state: len=%d, rate=%d", len, rate);
+        }
+    }
+    else {
+        // Standard frame (160 samples)
+        active_st = &st_large;
+        if (!*active_st) {
+            *active_st = speex_preprocess_state_init(len, rate);
+            speex_state_size = len;  // Keep track for debugging only
+            speex_state_rate = rate;
+            set_speex_filters_for_state(*active_st);
+            AUDIO_LOG("Created large-frame preprocessor state: len=%d, rate=%d", len, rate);
+        }
+    }
+    /*
 	if ( !st || speex_state_size != len || speex_state_rate != rate )
 	{
 		if (st)
@@ -271,14 +321,23 @@ static int input_postprocess(void *audio, int len, int rate)
 		speex_state_size = len;
 		speex_state_rate = rate;
 		set_speex_filters();
+        AUDIO_LOG("input_post_process: called set_speex_filters len=%d, rate=%d",len,rate);
 	}
-
+    */
 	calculate_level((short *)audio, len, &input_level);
-
+#ifdef VERBOSE
+    AUDIO_LOG("input_post_process: Calculated input level %4.4f", input_level);
+#endif
 	/* only preprocess if we're interested in VAD, AGC, or DENOISE */
-	if ( (iaxci_filters & (IAXC_FILTER_DENOISE | IAXC_FILTER_AGC)) ||
-			iaxci_silence_threshold > 0.0f )
-		silent = !speex_preprocess(st, (spx_int16_t *)audio, NULL);
+    if ((iaxci_filters & (IAXC_FILTER_DENOISE | IAXC_FILTER_AGC)) ||
+        iaxci_silence_threshold > 0.0f) {
+        
+        silent = !speex_preprocess(*active_st, (spx_int16_t*)audio, NULL);
+#ifdef VERBOSE
+        //Confirmed to be working 
+        AUDIO_LOG("input_post_process: Calling speex_preprocess got silent=(%d)", silent);
+#endif
+    }
 
 	/* Analog AGC: Bring speex AGC gain out to mixer, with lots of hysteresis */
 	/* use a higher continuation threshold for AAGC than for VAD itself */
@@ -300,10 +359,11 @@ static int input_postprocess(void *audio, int len, int rate)
 #else
 			loudness = st->loudness2;
 #endif
+            AUDIO_LOG("input_post_process: loudness=(%4.4f)", loudness);
 			if ( loudness > 8000.0f || loudness < 4000.0f )
 			{
 				const float level = iaxc_input_level_get();
-
+                AUDIO_LOG("input_post_process: iaxc_input_level_get: %4.4f, loudness=(%4.4f)", level,loudness);
 				if ( loudness > 16000.0f && level > 0.5f )
 				{
 					/* lower quickly if we're really too hot */
@@ -335,10 +395,18 @@ static int input_postprocess(void *audio, int len, int rate)
 	if ( volume < lowest_volume )
 		lowest_volume = volume;
 
-	if ( iaxci_silence_threshold > 0.0f )
-		return silent;
-	else
-		return volume < iaxci_silence_threshold;
+    if (iaxci_silence_threshold > 0.0f) {
+#ifdef VERBOSE
+        AUDIO_LOG("input_postprocess: iaxci_silence_threshold > 0.0f => declaring SILENCE (%d)", silent);
+#endif
+        return silent;
+    }
+    else {
+#ifdef VERBOSE
+        AUDIO_LOG("input_postprocess: Returning Volume:(%d) < iaxci_silence_threshold (%d)",volume, iaxci_silence_threshold);
+#endif
+        return volume < iaxci_silence_threshold;
+    }
 }
 
 static int output_postprocess(void *audio, int len)
@@ -385,7 +453,11 @@ EXPORT void iaxc_set_speex_settings(int decode_enhance, float quality,
 	speex_settings.abr = abr;
 	speex_settings.complexity = complexity;
 }
-
+static int ptt_active=-1;
+EXPORT void set_ptt(int val)
+{
+    ptt_active = val;
+}
 int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
         int format, int samples)
 {
@@ -409,7 +481,7 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
         // Write raw PCM data to file
         size_t written = fwrite(data, sizeof(short), insize, audio_capture_file);
         if (written != insize) {
-            AUDIO_LOG("WARNING: Failed to write all audio data: %zu/%d written", written, insize);
+            AUDIO_LOG("audio_send_encoded_audio:WARNING: Failed to write all audio data: %zu/%d written", written, insize);
         }
         audio_samples_written += insize;
         audio_capture_frame_count++;
@@ -418,22 +490,15 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
     
     // MODIFIED: Only do silence detection if not in PTT mode
     int silent = 0;
-    static int ptt_active = 0;
-    
-    if (audio_capture_file != NULL) {
-        // PTT is active, skip silence detection completely
-        ptt_active = 1;
-        // Set input level for better audio during PTT
-        iaxc_input_level_set(0.8f);
-        //AUDIO_LOG("PTT active: BYPASSING SILENCE DETECTION");
-    } else {
+    if(ptt_active>=0) {
+        iaxc_input_level_set(1.0f);
+#ifdef VERBOSE
+        AUDIO_LOG("audio_send_encoded_audio:PTT active: BYPASSING SILENCE DETECTION");
+#endif
+    }
+    else {
         // Only do normal silence detection when PTT is not active
         silent = input_postprocess(data, insize, 8000);
-        if (ptt_active) {
-            // PTT was active but now stopped, reset flag
-            ptt_active = 0;
-            AUDIO_LOG("PTT inactive: Returning to normal silence detection");
-        }
     }
 
     // Continue with regular IAX silence handling
@@ -444,7 +509,9 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
             call->tx_silent = 1;
             if ( iaxci_filters & IAXC_FILTER_CN )
                 iax_send_cng(call->session, 10, NULL, 0);
+            AUDIO_LOG("audio_send_encoded_audio: Sent comfort SILENT frame and returnig");
         }
+
         return 0;  // skip encoding silent frames for network
     }
 
@@ -465,16 +532,16 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
     /* create encoder if necessary */
     if(!call->encoder)
     {
-        AUDIO_LOG("Creating encoder for format: 0x%x", format);
+        AUDIO_LOG("audio_send_encoded_audio:Creating encoder for format: 0x%x", format);
         call->encoder = create_codec(format);
-        AUDIO_LOG("Encoder creation result: %s", call->encoder ? "SUCCESS" : "FAILED");
+        AUDIO_LOG("audio_send_encoded_audio:Encoder creation result: %s", call->encoder ? "SUCCESS" : "FAILED");
     }
 
     if(!call->encoder)
     {
         /* ERROR: no codec */
         fprintf(stderr, "ERROR: Codec could not be created: %d\n", format);
-        AUDIO_LOG("ERROR: Codec could not be created: %d\n", format);
+        AUDIO_LOG("audio_send_encoded_audio:ERROR: Codec could not be created: %d\n", format);
         return 0;
     }
 
@@ -485,16 +552,21 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
         fprintf(stderr, "ERROR: encode error: %d\n", format);
         return 0;
     }
-    AUDIO_LOG("Encoded %d bytes of audio data", sizeof(outbuf) - outsize);
-
+#ifdef VERBOSE
+    AUDIO_LOG("audio_send_encoded_audio:Encoded %d bytes of audio data", sizeof(outbuf) - outsize);
+#endif
     // Send the encoded audio data back to the app if required
     if (iaxc_get_audio_prefs() & IAXC_AUDIO_PREF_RECV_LOCAL_ENCODED) {
-        //AUDIO_LOG("Sending local encoded audio back to app (size=%d)", outsize);
+#ifdef VERBOSE
+        AUDIO_LOG("audio_send_encoded_audio:Sending local encoded audio back to app (size=%d)", outsize);
+#endif
         iaxci_do_audio_callback(callNo, 0, IAXC_SOURCE_LOCAL, 1,
                 call->encoder->format & IAXC_AUDIO_FORMAT_MASK,
                 sizeof(outbuf) - outsize, outbuf);
     } else {
-        //AUDIO_LOG("Not sending local encoded audio back to app (not enabled)");
+#ifdef VERBOSE
+        AUDIO_LOG("Not sending local encoded audio back to app (not enabled)");
+#endif
     }
 
     // Always send voice data regardless of callback preferences
@@ -502,10 +574,12 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
                 sizeof(outbuf) - outsize, samples-insize) == -1)
     {
         fprintf(stderr, "Failed to send voice! %s\n", iax_errstr);
-        AUDIO_LOG("Failed to send voice! %s\n", iax_errstr);
+        AUDIO_LOG("audio_send_encoded_audio:Failed to send voice! %s\n", iax_errstr);
         return -1;
     } else {
-        //AUDIO_LOG("Sent %d bytes of encoded audio data", sizeof(outbuf) - outsize);
+#ifdef VERBOSE
+        AUDIO_LOG("audio_send_encoded_audio:Sent %d bytes of encoded audio data", sizeof(outbuf) - outsize);
+#endif
     }
 
     return 0;
@@ -588,7 +662,7 @@ static FILE* create_wav_file(int sample_rate) {
     
     // Get current working directory for diagnostics
     if (GetCurrentDirectoryA(MAX_PATH, current_dir)) {
-        AUDIO_LOG("Current working directory: %s", current_dir);
+        AUDIO_LOG("create_wav_file:Current working directory: %s", current_dir);
     }
     
     time(&now);
@@ -597,10 +671,10 @@ static FILE* create_wav_file(int sample_rate) {
     // Format: audio_capture_YYYYMMDD_HHMMSS.wav
     strftime(filename, sizeof(filename), "audio_capture_%Y%m%d_%H%M%S.wav", timeinfo);
     
-    AUDIO_LOG("Attempting to create file: %s", filename);
+    AUDIO_LOG("create_wav_file:Attempting to create file: %s", filename);
     FILE* file = fopen(filename, "wb");
     if (!file) {
-        AUDIO_LOG("ERROR: Failed to create audio capture file: %s (errno=%d: %s)", 
+        AUDIO_LOG("create_wav_file:ERROR: Failed to create audio capture file: %s (errno=%d: %s)", 
                 filename, errno, strerror(errno));
         return NULL;
     }
@@ -623,7 +697,7 @@ static FILE* create_wav_file(int sample_rate) {
     fwrite(&fmt, sizeof(fmt), 1, file);
     fwrite(&data, sizeof(data), 1, file);
     
-    AUDIO_LOG("Successfully created audio capture file: %s", filename);
+    AUDIO_LOG("create_wav_file:Successfully created audio capture file: %s", filename);
     return file;
 }
 
@@ -635,7 +709,7 @@ static void finalize_wav_file(FILE* file, int data_size) {
     uint32_t data_chunk_size = data_size;
     uint32_t riff_chunk_size = 36 + data_chunk_size;
     
-    AUDIO_LOG("Finalizing WAV file with data_size=%d bytes", data_size);
+    AUDIO_LOG("finalize_wav_file:Finalizing WAV file with data_size=%d bytes", data_size);
     
     // Update RIFF chunk size
     fseek(file, 4, SEEK_SET);
@@ -650,7 +724,7 @@ static void finalize_wav_file(FILE* file, int data_size) {
     
     // Close the file
     fclose(file);
-    AUDIO_LOG("Audio capture completed. Wrote %d bytes of audio data.", data_size);
+    AUDIO_LOG("finalize_wav_file:Audio capture completed. Wrote %d bytes of audio data.", data_size);
 }
 
 // Function to start a new audio capture
@@ -680,7 +754,7 @@ EXPORT void iaxc_ptt_audio_capture_start(void) {
     if (audio_capture_file) {
         finalize_wav_file(audio_capture_file, audio_samples_written * 2);
         audio_capture_file = NULL;
-        AUDIO_LOG("Closed existing audio file before starting new one");
+        AUDIO_LOG("iaxc_ptt_audio_capture_start:Closed existing audio file before starting new one");
     }
     
     // Reset statistics
@@ -697,7 +771,7 @@ EXPORT void iaxc_ptt_audio_capture_start(void) {
     
     // Get the executable directory path
     if (GetModuleFileNameA(NULL, exe_path, MAX_PATH) == 0) {
-        AUDIO_LOG("ERROR: Failed to get executable path (error=%d)", GetLastError());
+        AUDIO_LOG("iaxc_ptt_audio_capture_start:ERROR: Failed to get executable path (error=%d)", GetLastError());
         return;
     }
     
@@ -709,7 +783,7 @@ EXPORT void iaxc_ptt_audio_capture_start(void) {
         exe_path[0] = '\0';
     }
     
-    AUDIO_LOG("Using executable directory: %s", exe_path);
+    AUDIO_LOG("iaxc_ptt_audio_capture_start:Using executable directory: %s", exe_path);
     
     time_t now;
     struct tm *timeinfo;
@@ -723,11 +797,11 @@ EXPORT void iaxc_ptt_audio_capture_start(void) {
              timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
              timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
     
-    AUDIO_LOG("ATTEMPTING TO CREATE FILE: %s", filename);
+    AUDIO_LOG("iaxc_ptt_audio_capture_start:ATTEMPTING TO CREATE FILE: %s", filename);
     
     FILE* file = fopen(filename, "wb");
     if (!file) {
-        AUDIO_LOG("ERROR: Failed to create PTT audio capture file: %s (errno=%d: %s)", 
+        AUDIO_LOG("iaxc_ptt_audio_capture_start:ERROR: Failed to create PTT audio capture file: %s (errno=%d: %s)", 
                  filename, errno, strerror(errno));
         return;
     }
@@ -735,7 +809,7 @@ EXPORT void iaxc_ptt_audio_capture_start(void) {
     // Go back to 8000Hz for the WAV file since that's the actual sample rate
     const int fixed_sample_rate = 8000;  // Standard telephone quality
     
-    AUDIO_LOG("Creating WAV with sample rate: %d Hz", fixed_sample_rate);
+    AUDIO_LOG("iaxc_ptt_audio_capture_start:Creating WAV with sample rate: %d Hz", fixed_sample_rate);
     
     // Write placeholder WAV header (will be updated when file is closed)
     RiffHeader riff = {{'R','I','F','F'}, 0, {'W','A','V','E'}};
@@ -756,7 +830,7 @@ EXPORT void iaxc_ptt_audio_capture_start(void) {
     fwrite(&data, sizeof(data), 1, file);
     
     audio_capture_file = file;
-    AUDIO_LOG("SUCCESS: Started PTT audio capture: %s (8000Hz sample rate)", filename);
+    AUDIO_LOG("iaxc_ptt_audio_capture_start:SUCCESS: Started PTT audio capture: %s (8000Hz sample rate)", filename);
     
     // Disable filters for better audio quality
     iaxc_ptt_filters_disable();
@@ -775,19 +849,19 @@ EXPORT void iaxc_ptt_audio_capture_stop(void) {
         finalize_wav_file(audio_capture_file, bytes_written);
         
         // Output comprehensive statistics
-        AUDIO_LOG("-------- AUDIO RECORDING STATISTICS --------");
-        AUDIO_LOG("Total samples written: %d samples", audio_samples_written);
-        AUDIO_LOG("Number of frames processed: %d frames", audio_capture_frame_count);
-        AUDIO_LOG("Average frame size: %.1f samples", (float)audio_samples_written / audio_capture_frame_count);
-        AUDIO_LOG("Audio duration: %.2f seconds (at 8000 Hz)", audio_duration);
-        AUDIO_LOG("Wall clock duration: %.2f seconds", wall_clock_duration);
-        AUDIO_LOG("Speed ratio: %.2f (ideal = 1.0)", audio_duration / wall_clock_duration);
-        AUDIO_LOG("File size: %d bytes", bytes_written);
-        AUDIO_LOG("Effective bitrate: %.1f kbps", bitrate);
-        AUDIO_LOG("Dynamic range: min=%d, max=%d (peak=%.1f%%)", 
+        AUDIO_LOG("iaxc_ptt_audio_capture_stop:-------- AUDIO RECORDING STATISTICS --------");
+        AUDIO_LOG("iaxc_ptt_audio_capture_stop:Total samples written: %d samples", audio_samples_written);
+        AUDIO_LOG("iaxc_ptt_audio_capture_stop:Number of frames processed: %d frames", audio_capture_frame_count);
+        AUDIO_LOG("iaxc_ptt_audio_capture_stop:Average frame size: %.1f samples", (float)audio_samples_written / audio_capture_frame_count);
+        AUDIO_LOG("iaxc_ptt_audio_capture_stop:Audio duration: %.2f seconds (at 8000 Hz)", audio_duration);
+        AUDIO_LOG("iaxc_ptt_audio_capture_stop:Wall clock duration: %.2f seconds", wall_clock_duration);
+        AUDIO_LOG("iaxc_ptt_audio_capture_stop:Speed ratio: %.2f (ideal = 1.0)", audio_duration / wall_clock_duration);
+        AUDIO_LOG("iaxc_ptt_audio_capture_stop:File size: %d bytes", bytes_written);
+        AUDIO_LOG("iaxc_ptt_audio_capture_stop:Effective bitrate: %.1f kbps", bitrate);
+        AUDIO_LOG("iaxc_ptt_audio_capture_stop:Dynamic range: min=%d, max=%d (peak=%.1f%%)", 
                  audio_min_sample, audio_max_sample, 
                  audio_max_sample * 100.0 / 32767.0);
-        AUDIO_LOG("------------------------------------------");
+        AUDIO_LOG("iaxc_ptt_audio_capture_stop:------------------------------------------");
         
         audio_capture_file = NULL;
         
@@ -807,13 +881,13 @@ EXPORT void iaxc_handle_audio_event(const char* message) {
 #ifdef SAVE_LOCAL_AUDIO    
     if (strcmp(message, "Radio key pressed") == 0) {
         iaxc_ptt_audio_capture_start();
-        AUDIO_LOG("Starting audio recording on PTT press");        
+        AUDIO_LOG("iaxc_handle_audio_event:Starting audio recording on PTT press");        
     } else if (strcmp(message, "Radio key released") == 0) {
         iaxc_ptt_audio_capture_stop();
-        AUDIO_LOG("Stopping audio recording on PTT release");        
+        AUDIO_LOG("iaxc_handle_audio_event:Stopping audio recording on PTT release");        
     }
 #else
-    AUDIO_LOG("PTT audio recordings are disabled in this build. No action taken.");    
+    AUDIO_LOG("iaxc_handle_audio_event:PTT audio recordings are disabled in this build. No action taken.");    
 #endif    
 }
 
@@ -845,7 +919,7 @@ void test_send_reference_tone(struct iaxc_call *call, int callNo) {
     }
     
     free(sine_wave);
-    AUDIO_LOG("Finished sending test tone");
+    AUDIO_LOG("test_send_reference_tone:Finished sending test tone");
 }
 
 // Temporarily disable/restore filters during PTT operations
@@ -856,12 +930,12 @@ EXPORT void iaxc_ptt_filters_disable(void) {
     saved_filters = iaxci_filters;
     // Keep only minimal necessary filters
     iaxc_set_filters(0);
-    AUDIO_LOG("PTT: Disabled audio filters for better voice quality");
+    AUDIO_LOG("iaxc_ptt_filters_disable:PTT: Disabled audio filters for better voice quality");
 }
 
 EXPORT void iaxc_ptt_filters_restore(void) {
     // Restore previous filters
     iaxc_set_filters(saved_filters);
-    AUDIO_LOG("PTT: Restored audio filters to previous settings");
+    AUDIO_LOG("iaxc_ptt_filters_restore:PTT: Restored audio filters to previous settings");
 }
 
