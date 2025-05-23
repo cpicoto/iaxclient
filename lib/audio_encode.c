@@ -312,18 +312,7 @@ static int input_postprocess(void *audio, int len, int rate)
             AUDIO_LOG("Created large-frame preprocessor state: len=%d, rate=%d", len, rate);
         }
     }
-    /*
-	if ( !st || speex_state_size != len || speex_state_rate != rate )
-	{
-		if (st)
-			speex_preprocess_state_destroy(st);
-		st = speex_preprocess_state_init(len,rate);
-		speex_state_size = len;
-		speex_state_rate = rate;
-		set_speex_filters();
-        AUDIO_LOG("input_post_process: called set_speex_filters len=%d, rate=%d",len,rate);
-	}
-    */
+
 	calculate_level((short *)audio, len, &input_level);
 #ifdef VERBOSE
     AUDIO_LOG("input_post_process: Calculated input level %4.4f", input_level);
@@ -491,7 +480,6 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
     // MODIFIED: Only do silence detection if not in PTT mode
     int silent = 0;
     if(ptt_active>=0) {
-        iaxc_input_level_set(1.0f);
 #ifdef VERBOSE
         AUDIO_LOG("audio_send_encoded_audio:PTT active: BYPASSING SILENCE DETECTION");
 #endif

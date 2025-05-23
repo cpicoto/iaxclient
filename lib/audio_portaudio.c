@@ -97,6 +97,10 @@ static SpeexEchoState *ec;
 
 
 typedef short SAMPLE;
+// Add this to the static variables section (around line 100, after sample_rate declaration)
+
+static int mixers_initialized;
+static float input_level = 1.0f;  // Add this line for the missing variable
 
 static PaStream *iStream, *oStream, *aStream;
 static PxMixer *iMixer = NULL, *oMixer = NULL;
@@ -558,7 +562,13 @@ static int pa_callback(
     const SAMPLE *inBuf = (const SAMPLE*)inputBuffer;
     SAMPLE *outBuf = (SAMPLE*)outputBuffer;
     static int debug_counter = 0;
-    
+
+    if (!iMixer && input_level != 1.0f && inputBuffer) {
+        short *samples = (short*)inputBuffer;
+        for (unsigned long i = 0; i < hostFrames; i++) {  // Use hostFrames instead of framesPerBuffer
+            samples[i] = (short)(samples[i] * input_level);
+        }
+    }
     // Skip processing if no input buffer but still clear output buffer
     if (!inputBuffer) {
         if (outputBuffer) {
@@ -1408,13 +1418,20 @@ static float pa_output_level_get(struct iaxc_audio_driver *d)
 
 static int pa_input_level_set(struct iaxc_audio_driver *d, float level)
 {
-	/* make sure this device supports input volume controls */
-	if ( !iMixer || Px_GetNumInputSources(iMixer) == 0 )
-		return -1;
-
-	Px_SetInputVolume(iMixer, level);
-
-	return 0;
+    PORT_LOG("pa_input_level_set: Setting input level to %f", level);
+    
+    // Check if mixer is available
+    if (iMixer) {
+        // Hardware mixer volume control
+        PORT_LOG("pa_input_level_set: Using hardware mixer control");
+        Px_SetInputVolume(iMixer, level);
+        return 0;
+    } else {
+        // Software gain adjustment
+        PORT_LOG("pa_input_level_set: No hardware mixer available, using software gain");
+        input_level = level;  // Store for software gain application
+        return 0;
+    }
 }
 
 static int pa_output_level_set(struct iaxc_audio_driver *d, float level)

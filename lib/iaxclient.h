@@ -783,9 +783,22 @@ EXPORT void iaxc_send_busy_on_incoming_call(int callNo);
 EXPORT void iaxc_answer_call(int callNo);
 
 /*!
+   Radio Transmitter Start Sending Test Tone
+   \param callNo The number of the call to Tranm
+*/
+EXPORT void iaxc_star_test_tone_radio(int callNo);
+
+/*!
+   Radio Transmitter Stop Sending Test Tone
+   \param callNo The number of the call to Tranm
+*/
+EXPORT void iaxc_stop_test_tone_radio(int callNo);
+
+/*!
    Radio Transmitter and Receiver Control Activiate
    \param callNo The number of the call to activate
 */
+
 EXPORT void iaxc_key_radio(int callNo);
 
 /*!

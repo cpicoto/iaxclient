@@ -1284,7 +1284,9 @@ static void iaxc_handle_network_event(struct iax_event *e, int callNo)
         break;
 
     case IAX_EVENT_PONG:
+	#ifdef VERBOSE
         IAX_LOG("iaxc_handle_network_event:IAX_EVENT_PONG explicitly received (callNo=%d)", callNo);
+	#endif
         generate_netstat_event(callNo);
         break;
 
@@ -1994,7 +1996,7 @@ EXPORT int iaxc_input_level_set(float level)
 {
 	if ( test_mode )
 		return 0;
-
+	IAX_LOG("iaxc_input_level_set to (%2.2f)", level);
 	return audio_driver.input_level_set(&audio_driver, level);
 }
 
@@ -2113,17 +2115,44 @@ EXPORT int iaxc_push_audio(void *data, unsigned int size, unsigned int samples)
 
 	return 0;
 }
+
 EXPORT void set_ptt(int val);
+
+EXPORT void iaxc_start_test_tone(int callNo)
+{
+	if (callNo < 0)
+		return;
+
+	iax_key_radio(calls[callNo].session);
+	iaxc_set_radiono(callNo);
+	set_ptt(callNo);
+#ifdef TODO_TEST_TONE
+	test_send_reference_tone(struct iaxc_call* call, callNo)
+#endif
+}
+
+EXPORT void iaxc_stop_test_tone(int callNo)
+{
+	if (callNo < 0)
+		return;
+
+	iax_key_radio(calls[callNo].session);
+
+	iaxc_set_radiono(callNo);
+	set_ptt(callNo);
+}
+
 EXPORT void iaxc_key_radio(int callNo)
 {
 	if ( callNo < 0 )
 		return;
 
 	iax_key_radio(calls[callNo].session);
-	IAX_LOG("iaxc_key_radio:Starting audio recording due to radio key (%d)", callNo);
+
 	iaxc_set_radiono(callNo);
 	set_ptt(callNo);
 #ifdef SAVE_LOCAL_AUDIO
+	IAX_LOG("iaxc_key_radio:Starting audio recording due to radio key (%d)", callNo);
 	iaxc_ptt_audio_capture_start();
 #endif
 }
@@ -2134,11 +2163,12 @@ EXPORT void iaxc_unkey_radio(int callNo)
 		return;
 
 	iax_unkey_radio(calls[callNo].session);
-	IAX_LOG("iaxc_unkey_radio:Stopping audio recording due to radio unkey (%d)",callNo);
+
 	iaxc_set_radiono(-1);
 	set_ptt(-1);
 #ifdef SAVE_LOCAL_AUDIO
     iaxc_ptt_audio_capture_stop();
+	IAX_LOG("iaxc_unkey_radio:Stopping audio recording due to radio unkey (%d)", callNo);
 #endif
 }
 
