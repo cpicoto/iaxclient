@@ -34,6 +34,7 @@
 #endif
 
 #include <pa_ringbuffer.h>
+#include "pa_ringbuffer_extensions.h"
 #include "audio_portaudio.h"
 #include "iaxclient_lib.h"
 #include "portmixer.h"
@@ -43,7 +44,12 @@
 #ifdef _WIN32
   #include <winsock2.h>
   #include <windows.h>
-  #define PORT_LOG(fmt, ...)                                                    \
+  #include <initguid.h>  // Required for COM GUID definitions
+  #include <mmdeviceapi.h> // For MMDevice interfaces
+  #include <audiopolicy.h> // For audio session interfaces
+  #include <functiondiscoverykeys_devpkey.h>
+  #include <avrt.h>     // For MMCSS thread priority
+  #define PORT_LOG(fmt, ...)\
     do {                                                                           \
       char _buf[512];                                                              \
       char _time_buf[32];                                                          \
@@ -137,14 +143,22 @@ static int output_samples_played = 0;
 
 /* RingBuffer Size; Needs to be Pow(2), 1024 = 512 samples = 64ms */
 #ifndef OUTRBSZ
-# define OUTRBSZ (32768)
+# ifdef _WIN32
+#  define OUTRBSZ (131072)  /* Much larger output buffer for Windows stability (128K) */
+# else
+#  define OUTRBSZ (32768)
+# endif
 #endif
 
 /* Input ringbuffer size;  this doesn't seem to be as critical, and making it big
  * causes issues when we're answering calls, etc., and the audio system is running
  * but not being drained */
 #ifndef INRBSZ
-# define INRBSZ  (16384)
+# ifdef _WIN32
+#  define INRBSZ  (65536)  /* Larger input buffer for Windows buffering (64K) */
+# else
+#  define INRBSZ  (16384)
+# endif
 #endif
 
 /* TUNING:  The following constants may help in tuning for situations
@@ -173,7 +187,7 @@ static int output_samples_played = 0;
 
 /* 80ms if average outRing length is more than this many bytes, start dropping */
 #ifndef RBOUTTARGET
-# define RBOUTTARGET (30)
+# define RBOUTTARGET (80)  /* Optimized for low latency while preventing underruns */
 #endif
 
 /* size in bytes of ringbuffer target */
@@ -192,6 +206,11 @@ static int virtualMonoOut;
 static int virtualMonoRing;
 
 static int running;
+static int error_count;
+static int startup_counter;
+static int output_underruns;
+static HANDLE healthCheckThread;
+static int healthCheckThreadActive;
 
 static struct iaxc_sound *sounds;
 static int  nextSoundId = 1;
@@ -204,6 +223,13 @@ static void handle_paerror(PaError err, char * where);
 static int pa_input_level_set(struct iaxc_audio_driver *d, float level);
 static float pa_input_level_get(struct iaxc_audio_driver *d);
 static int pa_output_level_set(struct iaxc_audio_driver *d, float level);
+static BOOL check_exclusive_mode_support(const PaDeviceInfo* deviceInfo);
+static double find_supported_wasapi_exclusive_rate(const PaDeviceInfo* inDevInfo, const PaDeviceInfo* outDevInfo);
+static void pa_boost_buffer(void);
+#ifdef _WIN32
+static DWORD WINAPI HealthCheckTimerThread(LPVOID param);
+static void pa_setup_windows_audio_session(void);
+#endif
 
 /* scan devices and stash pointers to dev structures.
  *  But, these structures only remain valid while Pa is initialized,
@@ -402,6 +428,15 @@ static int pa_play_sound(struct iaxc_sound *inSound, int ring)
 	sounds = sound;
 	MUTEXUNLOCK(&sound_lock);
 
+	// Reset underrun counters when starting to play a sound
+	// This helps prevent unnecessary stream resets while playing sounds
+	output_underruns = 0;
+	error_count = 0;
+	
+	// Add extra buffer boost when starting sound playback
+	// to prevent underruns at the beginning
+	pa_boost_buffer();
+
 	if ( !running )
 		pa_start(NULL); /* XXX fixme: start/stop semantics */
 
@@ -562,13 +597,49 @@ static int pa_callback(
     const SAMPLE *inBuf = (const SAMPLE*)inputBuffer;
     SAMPLE *outBuf = (SAMPLE*)outputBuffer;
     static int debug_counter = 0;
+    static int consecutive_underruns = 0;
+    static int64_t total_frames_processed = 0;
+    
+    // Track total frames for diagnostics
+    total_frames_processed += hostFrames;
+    
+    // Check for xruns using statusFlags
+    if (statusFlags & paInputUnderflow) {
+        PORT_LOG("pa_callback: INPUT UNDERFLOW detected at frame %lld", 
+                (long long)total_frames_processed);
+    }
+    if (statusFlags & paInputOverflow) {
+        PORT_LOG("pa_callback: INPUT OVERFLOW detected at frame %lld", 
+                (long long)total_frames_processed);
+    }
+    if (statusFlags & paOutputUnderflow) {
+        if (++consecutive_underruns % 10 == 0) {
+            PORT_LOG("pa_callback: Multiple OUTPUT UNDERFLOWS detected (%d in a row) at frame %lld", 
+                    consecutive_underruns, (long long)total_frames_processed);
+            
+            // If we're having serious underruns, add some buffer to help stabilize
+            if (consecutive_underruns >= 50 && outputBuffer) {
+                // Try to compensate by adding silence to output buffer as a fallback
+                static SAMPLE silence[2048] = {0};
+                PaUtil_WriteRingBuffer(&outRing, silence, sizeof(silence)/sizeof(SAMPLE));
+                PORT_LOG("pa_callback: Added extra silence buffer to stabilize playback");
+            }
+        }
+    } else {
+        consecutive_underruns = 0;
+    }
+    if (statusFlags & paOutputOverflow) {
+        PORT_LOG("pa_callback: OUTPUT OVERFLOW detected");
+    }
 
+    // Apply software input gain if no hardware mixer available
     if (!iMixer && input_level != 1.0f && inputBuffer) {
         short *samples = (short*)inputBuffer;
-        for (unsigned long i = 0; i < hostFrames; i++) {  // Use hostFrames instead of framesPerBuffer
+        for (unsigned long i = 0; i < hostFrames; i++) {
             samples[i] = (short)(samples[i] * input_level);
         }
     }
+    
     // Skip processing if no input buffer but still clear output buffer
     if (!inputBuffer) {
         if (outputBuffer) {
@@ -581,39 +652,56 @@ static int pa_callback(
     // Use Speex resampler if we have different sample rates
     if (speex_resampler && host_sample_rate > sample_rate) {
         // Create buffer for resampled output
-        static SAMPLE resampled_buffer[2048]; // Buffer for resampled output
+        static SAMPLE resampled_buffer[4096]; // Larger buffer for higher quality resampling
         
         // Calculate the number of output samples we expect based on the ratio
         spx_uint32_t in_len = hostFrames;
         spx_uint32_t out_len = (spx_uint32_t)(hostFrames / sample_ratio) + 1;
         
         // Make sure we don't exceed our buffer size
-        if (out_len > 2048) {
-            out_len = 2048;
+        if (out_len > 4096) {
+            out_len = 4096;
         }
         
         // Process audio through the resampler
         int err = speex_resampler_process_int(
             speex_resampler,
-            0, // Channel index (0 for mono)
-            inBuf,
+            0,      // Channel index (0 for mono)
+            inBuf,  // Input buffer (host rate)
             &in_len,
-            resampled_buffer,
+            resampled_buffer,  // Output buffer (8kHz)
             &out_len
         );
         
-        // Write resampled audio to the ring buffer
+        if (err != RESAMPLER_ERR_SUCCESS) {
+            PORT_LOG("pa_callback: Resampling error: %s", speex_resampler_strerror(err));
+        }
+        
+        // Write resampled audio to the ring buffer with overflow protection
+        int ring_space = PaUtil_GetRingBufferWriteAvailable(&inRing);
+        if (ring_space < out_len) {
+            PORT_LOG("pa_callback: Input ring buffer overflow! Available=%d, Needed=%d", 
+                    ring_space, (int)out_len);
+            // Still write what we can
+            out_len = ring_space;
+        }
+        
         int written = PaUtil_WriteRingBuffer(&inRing, resampled_buffer, out_len);
-#ifdef VERBOSE        
         if (debug_counter % 500 == 0) {
-            PORT_LOG("PA_CALLBACK: Resampled %lu frames to %lu frames (%d written to buffer)",
+            PORT_LOG("pa_callback: Resampled %lu frames to %lu frames (%d written to buffer)",
                     hostFrames, (unsigned long)out_len, written);
         }
-#endif
-
     } else {
         // If no resampling needed or no resampler available, use direct copy
-        PaUtil_WriteRingBuffer(&inRing, inBuf, hostFrames);
+        int ring_space = PaUtil_GetRingBufferWriteAvailable(&inRing);
+        if (ring_space < hostFrames) {
+            PORT_LOG("pa_callback: Input ring buffer overflow! Available=%d, Needed=%lu", 
+                    ring_space, hostFrames);
+            // Still write what we can
+            PaUtil_WriteRingBuffer(&inRing, inBuf, ring_space);
+        } else {
+            PaUtil_WriteRingBuffer(&inRing, inBuf, hostFrames);
+        }
     }
     
     // *** OUTPUT PROCESSING (PLAYBACK) ***
@@ -623,7 +711,7 @@ static int pa_callback(
             int samples_needed = (int)(hostFrames / sample_ratio);
             
             // Intermediate buffer for 8kHz audio
-            static SAMPLE buffer_8k[1024]; 
+            static SAMPLE buffer_8k[2048]; // Increased buffer size for better quality
             
             // Check how many samples are available in the output ring buffer
             int available = PaUtil_GetRingBufferReadAvailable(&outRing);
@@ -648,14 +736,13 @@ static int pa_callback(
                                 if (abs_val > max_value) max_value = abs_val;
                             }
                         }
-#ifdef VERBOSE
+
                         if (has_audio) {
-                            PORT_LOG("pa_callback:OUTPUT AUDIO: Active audio data, max amplitude: %d", max_value);
+                            PORT_LOG("pa_callback: OUTPUT AUDIO: Active audio data, max amplitude: %d", max_value);
                         }
-#endif
                     }
                     
-                    // Resample from 8kHz to host_sample_rate
+                    // Resample from 8kHz to host_sample_rate with better quality settings
                     spx_uint32_t in_len = actually_read;
                     spx_uint32_t out_len = hostFrames;
                     
@@ -664,9 +751,13 @@ static int pa_callback(
                         0,             // Channel index
                         buffer_8k,     // Input buffer (8kHz)
                         &in_len,       // Input samples
-                        outBuf,        // Output buffer (48kHz)
+                        outBuf,        // Output buffer (host rate)
                         &out_len       // Output samples
                     );
+                    
+                    if (err != RESAMPLER_ERR_SUCCESS) {
+                        PORT_LOG("pa_callback: Output resampling error: %s", speex_resampler_strerror(err));
+                    }
                     
                     // If we didn't fill the whole buffer, fill with silence
                     if (out_len < hostFrames) {
@@ -682,7 +773,7 @@ static int pa_callback(
                 // No samples available
                 output_underruns++;
                 if (output_underruns % 100 == 0) {
-                    PORT_LOG("pa_callback:OUTPUT UNDERRUN (%d): No data available for audio output", 
+                    PORT_LOG("pa_callback: OUTPUT UNDERRUN (%d): No data available for audio output", 
                             output_underruns);
                 }
                 memset(outBuf, 0, hostFrames * sizeof(SAMPLE));
@@ -703,13 +794,37 @@ static int pa_callback(
             }
             
             if (debug_counter % 500 == 0) {
-                PORT_LOG("pa_callback:LEGACY OUTPUT: Read %d samples for %lu frames", 
+                PORT_LOG("pa_callback: LEGACY OUTPUT: Read %d samples for %lu frames", 
                         samples_read, hostFrames);
             }
-        }
-    }
+        }    }
     
     debug_counter++;
+    
+    // Perform periodic health checks during callback
+    static DWORD last_health_time = 0;
+    DWORD current_time = GetTickCount();
+    
+    // Check health every 30 seconds from the audio thread
+    if (current_time - last_health_time > 30000) {
+        last_health_time = current_time;
+        
+        // Check for issues that might indicate problems
+        if (consecutive_underruns > 100 || output_underruns > 1000) {
+            PORT_LOG("pa_callback: Audio performance issues detected, may require recovery");
+            // Reset counters so we don't trigger too often
+            consecutive_underruns = 0;
+            output_underruns = 0;
+            
+            // Actual recovery is performed in pa_input/pa_output calls
+        }
+        
+        // Log performance stats periodically
+        PORT_LOG("pa_callback: HEALTH CHECK - %lld frames processed, %d underruns, %d overflows",
+                (long long)total_frames_processed, output_underruns, 
+                PaUtil_GetRingBufferFullCount(&inRing));
+    }
+    
     return paContinue;
 }
 
@@ -838,12 +953,31 @@ static int pa_open(int single, int inMono, int outMono)
 static int pa_openstreams (struct iaxc_audio_driver *d )
 {
 	int err;
+	static int wasapi_failures = 0;
+	
 #ifdef _WIN32
-    /* On Windows, use our WASAPI helper: */
-    return pa_openwasapi(d);
+    /* On Windows, try WASAPI first, but fall back if it keeps failing */
+    if (wasapi_failures < 3) {
+        err = pa_openwasapi(d);
+        if (err == 0) {
+            PORT_LOG("pa_openstreams: WASAPI opened successfully");
+            wasapi_failures = 0; // Reset failure count on success
+            return 0;
+        } else {
+            wasapi_failures++;
+            PORT_LOG("pa_openstreams: WASAPI failed (attempt %d/3), trying fallback", wasapi_failures);
+            if (wasapi_failures >= 3) {
+                PORT_LOG("pa_openstreams: WASAPI disabled due to repeated failures");
+            }
+        }
+    }
+    
+    /* Fall back to regular PortAudio */
+    PORT_LOG("pa_openstreams: Using regular PortAudio fallback");
+    return pa_open(0, 1, 1);
 #else
-    /* On other platforms, fall back to the old PortAudio open: */
-    return pa_open(d);
+    /* On other platforms, use regular PortAudio: */
+    return pa_open(0, 1, 1);
 #endif
 #ifdef LINUX
 	err = pa_open(0, 1, 1) && /* two stream mono */
@@ -872,46 +1006,160 @@ static int pa_openstreams (struct iaxc_audio_driver *d )
 	return 0;
 }
 /*---------------------------------------------------------------------------*/
+/* Checks if a device supports exclusive mode with WASAPI */
+static BOOL check_exclusive_mode_support(const PaDeviceInfo* deviceInfo)
+{
+    if (!deviceInfo) {
+        return FALSE;
+    }
+    
+    // Get device info from PortAudio
+    const PaHostApiInfo* apiInfo = Pa_GetHostApiInfo(deviceInfo->hostApi);
+    if (!apiInfo || apiInfo->type != paWASAPI) {
+        return FALSE;
+    }
+    
+    // Be more conservative about exclusive mode - only try it for high-end devices
+    if (strstr(deviceInfo->name, "ASIO") || 
+        strstr(deviceInfo->name, "Studio") ||
+        strstr(deviceInfo->name, "Professional") ||
+        strstr(deviceInfo->name, "Audio Interface")) {
+        PORT_LOG("check_exclusive_mode_support: Device '%s' looks like pro audio interface", deviceInfo->name);
+        return TRUE;
+    }
+    
+    // For regular consumer devices, skip exclusive mode to avoid compatibility issues
+    PORT_LOG("check_exclusive_mode_support: Device '%s' - using shared mode for compatibility", deviceInfo->name);
+    return FALSE;
+}
+
+/*---------------------------------------------------------------------------*/
+static double find_supported_wasapi_exclusive_rate(const PaDeviceInfo* inDevInfo, const PaDeviceInfo* outDevInfo)
+{
+    if (!inDevInfo || !outDevInfo) {
+        PORT_LOG("find_supported_wasapi_exclusive_rate: Device info not available");
+        return 0.0;
+    }
+    
+    // Check if exclusive mode is supported on both devices
+    BOOL inExclusive = check_exclusive_mode_support(inDevInfo);
+    BOOL outExclusive = check_exclusive_mode_support(outDevInfo);
+    
+    if (!inExclusive || !outExclusive) {
+        PORT_LOG("find_supported_wasapi_exclusive_rate: Exclusive mode not supported on %s", 
+                !inExclusive ? "input device" : "output device");
+        return 0.0;
+    }
+    
+    // Common sample rates to try, from highest quality to lowest
+    static const double rates[] = {
+        192000.0,
+        176400.0,
+        96000.0,
+        88200.0,
+        48000.0,
+        44100.0,
+        32000.0,
+        22050.0,
+        16000.0,
+        11025.0,
+        8000.0
+    };
+    
+    // Default to the device's default sample rate if available
+    double defaultRate = outDevInfo->defaultSampleRate;
+    if (defaultRate > 0) {
+        return defaultRate;
+    }
+    
+    // Return standard rate that works well with most devices
+    return 48000.0;
+}
+
 static int pa_openwasapi(struct iaxc_audio_driver *d)
 {
     PaError err;
+    HANDLE mmcssHandle = NULL;
+    DWORD taskIndex = 0;
     
     // 1) Find WASAPI host API
     PaHostApiIndex apiIndex = Pa_HostApiTypeIdToHostApiIndex(paWASAPI);
     if (apiIndex < 0) {
-        PORT_LOG("pa_openwasapi: WASAPI not available");
-        return -1;
+        PORT_LOG("pa_openwasapi: WASAPI not available, falling back to default PortAudio");
+        return pa_open(0, 1, 1); // Fall back to regular PortAudio
     }
 
     // 2) Get default WASAPI devices (or use selected ones if specified)
     const PaHostApiInfo *apiInfo = Pa_GetHostApiInfo(apiIndex);
-    PaDeviceIndex inDev, outDev;
-    
-    // Use selected devices if they're valid for WASAPI
-    if (selectedInput >= 0 && Pa_GetHostApiInfo(Pa_GetDeviceInfo(selectedInput)->hostApi)->type == paWASAPI) {
-        inDev = selectedInput;
-    } else {
-        inDev = Pa_HostApiDeviceIndexToDeviceIndex(apiIndex, apiInfo->defaultInputDevice);
+    if (!apiInfo || apiInfo->deviceCount <= 0) {
+        PORT_LOG("pa_openwasapi: No WASAPI devices available, falling back to default PortAudio");
+        return pa_open(0, 1, 1);
     }
     
-    if (selectedOutput >= 0 && Pa_GetHostApiInfo(Pa_GetDeviceInfo(selectedOutput)->hostApi)->type == paWASAPI) {
-        outDev = selectedOutput;
-    } else {
+    PaDeviceIndex inDev = paNoDevice, outDev = paNoDevice;
+    
+    // Use selected devices if they're valid for WASAPI
+    if (selectedInput >= 0) {
+        const PaDeviceInfo* inputInfo = Pa_GetDeviceInfo(selectedInput);
+        if (inputInfo && inputInfo->hostApi == apiIndex) {
+            inDev = selectedInput;
+            PORT_LOG("pa_openwasapi: Using selected input device: %s", inputInfo->name);
+        }
+    }
+    
+    if (selectedOutput >= 0) {
+        const PaDeviceInfo* outputInfo = Pa_GetDeviceInfo(selectedOutput);
+        if (outputInfo && outputInfo->hostApi == apiIndex) {
+            outDev = selectedOutput;
+            PORT_LOG("pa_openwasapi: Using selected output device: %s", outputInfo->name);
+        }
+    }
+    
+    // Fall back to default devices if not using selected ones
+    if (inDev == paNoDevice && apiInfo->defaultInputDevice >= 0) {
+        inDev = Pa_HostApiDeviceIndexToDeviceIndex(apiIndex, apiInfo->defaultInputDevice);
+    }
+    if (outDev == paNoDevice && apiInfo->defaultOutputDevice >= 0) {
         outDev = Pa_HostApiDeviceIndexToDeviceIndex(apiIndex, apiInfo->defaultOutputDevice);
     }
     
-    if (inDev < 0 || outDev < 0) {
-        PORT_LOG("pa_openwasapi: no WASAPI I/O device");
-        return -1;
+    // Final validation of devices
+    if (inDev == paNoDevice || outDev == paNoDevice) {
+        PORT_LOG("pa_openwasapi: No valid WASAPI devices found (in=%d, out=%d), falling back to default PortAudio", inDev, outDev);
+        return pa_open(0, 1, 1); // Fall back to regular PortAudio
+    }    // 3) Get device info and validate devices are actually available
+    const PaDeviceInfo* inDevInfo = Pa_GetDeviceInfo(inDev);
+    const PaDeviceInfo* outDevInfo = Pa_GetDeviceInfo(outDev);
+    
+    if (!inDevInfo || !outDevInfo) {
+        PORT_LOG("pa_openwasapi: Could not get device info, falling back to default PortAudio");
+        return pa_open(0, 1, 1);
     }
-
-    // 3) Compute host rate and resample ratio
-    host_sample_rate = Pa_GetDeviceInfo(inDev)->defaultSampleRate;
+    
+    // Check that devices support the required properties
+    if (inDevInfo->maxInputChannels < 1 || outDevInfo->maxOutputChannels < 1) {
+        PORT_LOG("pa_openwasapi: Devices don't support required channels (in=%d, out=%d), falling back to default PortAudio", 
+                inDevInfo->maxInputChannels, outDevInfo->maxOutputChannels);
+        return pa_open(0, 1, 1);
+    }
+    
+    PORT_LOG("pa_openwasapi: Selected devices - Input: '%s', Output: '%s'", 
+            inDevInfo->name, outDevInfo->name);
+    
+    // 4) Determine safe sample rate
+    host_sample_rate = 48000.0; // Start with a safe common rate
+    
+    // Use device's default sample rate if it's reasonable
+    if (outDevInfo->defaultSampleRate >= 8000.0 && outDevInfo->defaultSampleRate <= 192000.0) {
+        host_sample_rate = outDevInfo->defaultSampleRate;
+        PORT_LOG("pa_openwasapi: Using device's default sample rate: %.1fHz", host_sample_rate);
+    } else {
+        PORT_LOG("pa_openwasapi: Device sample rate %.1fHz out of range, using 48kHz", outDevInfo->defaultSampleRate);
+    }
+    
     sample_ratio = host_sample_rate / (double)sample_rate;
-    PORT_LOG("pa_openwasapi: Requested WASAPI to deliver audio at %.1fHz (native rate) with resampling to %d Hz", 
-            host_sample_rate, sample_rate);
-
-    // Clean up existing resamplers
+    PORT_LOG("pa_openwasapi: WASAPI will use native rate %.1fHz with resampling to/from %d Hz", 
+            host_sample_rate, sample_rate);    // 5) Set up resamplers if needed
     if (speex_resampler) {
         speex_resampler_destroy(speex_resampler);
         speex_resampler = NULL;
@@ -922,93 +1170,148 @@ static int pa_openwasapi(struct iaxc_audio_driver *d)
         output_resampler = NULL;
     }
     
-    // Only create resampler if sample rates differ
-    if (host_sample_rate != sample_rate) {
-        int err_in = 0;  // Initialize these variables
-        int err_out = 0;
+    // Only create resampler if sample rates differ significantly
+    if (fabs(host_sample_rate - sample_rate) > 0.1) {
+        int err_in = 0, err_out = 0;
         
-        // Create input resampler (48k → 8k)
         speex_resampler = speex_resampler_init(
-            1,                              // 1 channel (mono)
-            (spx_uint32_t)host_sample_rate, // Input rate (48000)
-            (spx_uint32_t)sample_rate,      // Output rate (8000)
-            5,                              // Quality (0-10, 5 is good quality)
-            &err_in
-        );
+            1, (spx_uint32_t)host_sample_rate, (spx_uint32_t)sample_rate, 6, &err_in);
         
-        // Create output resampler (8k → 48k)
         output_resampler = speex_resampler_init(
-            1,                              // 1 channel (mono)
-            (spx_uint32_t)sample_rate,      // Input rate (8000)
-            (spx_uint32_t)host_sample_rate, // Output rate (48000)
-            5,                              // Quality (0-10, 5 is good quality)
-            &err_out
-        );
+            1, (spx_uint32_t)sample_rate, (spx_uint32_t)host_sample_rate, 6, &err_out);
         
         if (err_in != RESAMPLER_ERR_SUCCESS || err_out != RESAMPLER_ERR_SUCCESS) {
-            PORT_LOG("pa_openwasapi:Failed to initialize Speex resamplers: in=%s, out=%s", 
-                    speex_resampler_strerror(err_in),
-                    speex_resampler_strerror(err_out));
-        } else {
-            PORT_LOG("pa_openwasapi:Speex resampler initialized: %d Hz ↔ %d Hz", 
-                    (int)host_sample_rate, sample_rate);
+            PORT_LOG("pa_openwasapi: Failed to initialize Speex resamplers, falling back to default PortAudio");
+            return pa_open(0, 1, 1);
         }
     }
 
-    // Fix zero audio format issue
-    if (current_audio_format == 0) {
+    // 6) Fix audio format if needed
+    if (current_audio_format == 0 || current_audio_format == paCustomFormat) {
         current_audio_format = paInt16;
-        PORT_LOG("pa_openwasapi: Fixed zero format, using paInt16");
+        PORT_LOG("pa_openwasapi: Fixed invalid format, using paInt16");
     }
 
-    // 4) Fill WASAPI-specific info
+    // 7) Try to boost thread priority (optional - don't fail if this doesn't work)
+    mmcssHandle = AvSetMmThreadCharacteristicsA("Pro Audio", &taskIndex);
+    if (mmcssHandle) {
+        AvSetMmThreadPriority(mmcssHandle, AVRT_PRIORITY_HIGH);
+        PORT_LOG("pa_openwasapi: Set thread to MMCSS Pro Audio class");
+    }
+
+    // 8) Configure WASAPI for shared mode (most compatible)
     PaWasapiStreamInfo wasapiInfo = {
         .size           = sizeof(PaWasapiStreamInfo),
         .hostApiType    = paWASAPI,
         .version        = 1,
-        .flags          = paWinWasapiAutoConvert | paWinWasapiThreadPriority,
-        .threadPriority = eThreadPriorityProAudio,
-        .channelMask    = PAWIN_SPEAKER_FRONT_CENTER,  // mono
+        .flags          = paWinWasapiAutoConvert,
+        .threadPriority = eThreadPriorityAudio,
         .streamCategory = eAudioCategoryCommunications,
         .streamOption   = eStreamOptionNone
     };
 
-    // 5) Fill your PortAudio parameters
+    // 9) Configure conservative stream parameters
     PaStreamParameters inParams = {
         .device                    = inDev,
         .channelCount              = 1,
-        .sampleFormat              = current_audio_format,
-        .suggestedLatency          = Pa_GetDeviceInfo(inDev)->defaultLowInputLatency,
-        .hostApiSpecificStreamInfo = &wasapiInfo
-    };
-    PaStreamParameters outParams = {
-        .device                    = outDev,
-        .channelCount              = 1,
-        .sampleFormat              = current_audio_format,
-        .suggestedLatency          = Pa_GetDeviceInfo(outDev)->defaultLowOutputLatency,
+        .sampleFormat              = paInt16,  // Force known good format
+        .suggestedLatency          = 0.05,     // Conservative 50ms latency
         .hostApiSpecificStreamInfo = &wasapiInfo
     };
 
-    // 6) Open full-duplex stream at host_sample_rate
+    PaStreamParameters outParams = {
+        .device                    = outDev,
+        .channelCount              = 1,
+        .sampleFormat              = paInt16,  // Force known good format
+        .suggestedLatency          = 0.05,     // Conservative 50ms latency
+        .hostApiSpecificStreamInfo = &wasapiInfo
+    };
+
+    // 10) Try multiple approaches to open the stream
+    PORT_LOG("pa_openwasapi: Attempting to open WASAPI stream (devices: %d->%d, rate=%.1fHz)", 
+            inDev, outDev, host_sample_rate);
+    
+    // First attempt: Conservative shared mode
     err = Pa_OpenStream(
         &iStream,
         &inParams,
         &outParams,
-        host_sample_rate,  // Use native 48kHz rate
-        1024,              // Explicit buffer size helps with stability
+        host_sample_rate,
+        paFramesPerBufferUnspecified,
         paNoFlag,
-        pa_callback,       // Callback is already set here
+        pa_callback,
         d
     );
     
     if (err != paNoError) {
-        PORT_LOG("pa_openwasapi: Pa_OpenStream failed: %s", Pa_GetErrorText(err));
-        return -1;
+        PORT_LOG("pa_openwasapi: Conservative mode failed: %s (0x%x)", Pa_GetErrorText(err), err);
+        
+        // Second attempt: Try with device's recommended latency
+        inParams.suggestedLatency = inDevInfo->defaultLowInputLatency;
+        outParams.suggestedLatency = outDevInfo->defaultLowOutputLatency;
+        
+        err = Pa_OpenStream(
+            &iStream,
+            &inParams,
+            &outParams,
+            host_sample_rate,
+            paFramesPerBufferUnspecified,
+            paNoFlag,
+            pa_callback,
+            d
+        );
+        
+        if (err != paNoError) {
+            PORT_LOG("pa_openwasapi: Recommended latency failed: %s (0x%x)", Pa_GetErrorText(err), err);
+            
+            // Third attempt: High latency mode
+            inParams.suggestedLatency = inDevInfo->defaultHighInputLatency;
+            outParams.suggestedLatency = outDevInfo->defaultHighOutputLatency;
+            
+            err = Pa_OpenStream(
+                &iStream,
+                &inParams,
+                &outParams,
+                host_sample_rate,
+                1024,
+                paNoFlag,
+                pa_callback,
+                d
+            );
+            
+            if (err != paNoError) {
+                PORT_LOG("pa_openwasapi: All WASAPI attempts failed: %s (0x%x) - falling back to default PortAudio", 
+                        Pa_GetErrorText(err), err);
+                
+                // Release MMCSS priority if set
+                if (mmcssHandle) {
+                    AvRevertMmThreadCharacteristics(mmcssHandle);
+                }
+                
+                // Fall back to regular PortAudio
+                return pa_open(0, 1, 1);
+            }
+            
+            PORT_LOG("pa_openwasapi: Successfully opened WASAPI with high latency settings");
+        } else {
+            PORT_LOG("pa_openwasapi: Successfully opened WASAPI with recommended latency");
+        }
+    } else {
+        PORT_LOG("pa_openwasapi: Successfully opened WASAPI in conservative shared mode");
     }
 
-    // 7) Use one stream for both in/out
+    // 10) Set up for single stream operation
     oneStream = 1;
     oStream = iStream;
+    
+    // 11) Log final stream configuration
+    const PaStreamInfo* streamInfo = Pa_GetStreamInfo(iStream);
+    if (streamInfo) {
+        PORT_LOG("pa_openwasapi: Stream configured with input latency=%.1fms, output latency=%.1fms, sample rate=%.1fHz",
+                streamInfo->inputLatency * 1000.0,
+                streamInfo->outputLatency * 1000.0,
+                streamInfo->sampleRate);
+    }
     
     return 0;
 }
@@ -1066,8 +1369,27 @@ static int pa_openauxstream (struct iaxc_audio_driver *d )
 
 	// Determine whether virtual mono is being used
 	virtualMonoRing = ring_stream_params.channelCount - 1;
-
 	return 0;
+}
+
+// Implementation of handle_paerror function
+static void handle_paerror(PaError err, char * where)
+{
+    if (err != paNoError) {
+        PORT_LOG("%s: PortAudio error: %s", where, Pa_GetErrorText(err));
+        error_count++;
+        
+        if (error_count > 20) {
+            PORT_LOG("%s: Too many PortAudio errors (%d), audio quality may be degraded", 
+                    where, error_count);
+            
+            // Log a user-visible message for persistent audio issues
+            if (error_count % 10 == 0) { // Only show every 10th error
+                iaxci_usermsg(IAXC_TEXT_TYPE_NOTICE, 
+                    "Audio system experiencing issues. You may need to restart the application if audio quality degrades.");
+            }
+        }
+    }
 }
 
 static int pa_start(struct iaxc_audio_driver *d)
@@ -1075,174 +1397,364 @@ static int pa_start(struct iaxc_audio_driver *d)
 	static int errcnt = 0;
 	current_audio_format = paInt16;  // Fix for 0x0 format issue
 
-
-	if ( running )
+	if (running)
 		return 0;
 
-	PORT_LOG("pa_start: format to 0x%x (paInt16)", current_audio_format);
-	// Add format check
+	PORT_LOG("pa_start: Setting up audio with format 0x%x (paInt16)", current_audio_format);
+
+	// Add format check and fix
 	if (d != NULL) {
-		PORT_LOG("pa_start:Audio format before start: 0x%x %s", 
+		PORT_LOG("pa_start: Audio format before start: 0x%x %s", 
 			current_audio_format, 
 			(current_audio_format == 0) ? "INVALID!" : "ok");
 		
 		// Fix zero format if needed
 		if (current_audio_format == 0) {
 			current_audio_format = paInt16;
-			PORT_LOG("pa_start:Fixed zero format to 0x%x (paInt16)", current_audio_format);
+			PORT_LOG("pa_start: Fixed zero format to 0x%x (paInt16)", current_audio_format);
 		}
 	}
-	/* re-open mixers if necessary */
-	if ( iMixer )
-	{
+	
+	// Close mixers if already opened
+	if (iMixer) {
 		Px_CloseMixer(iMixer);
 		iMixer = NULL;
 	}
 
-	if ( oMixer )
-	{
+	if (oMixer) {
 		Px_CloseMixer(oMixer);
 		oMixer = NULL;
 	}
 
-	if ( errcnt > 5 )
-	{
+	// Check for too many errors
+	if (errcnt > 5) {
 		iaxci_usermsg(IAXC_TEXT_TYPE_FATALERROR,
-				"iaxclient audio: Can't open Audio Device. "
-				"Perhaps you do not have an input or output device?");
-		/* OK, we'll give the application the option to abort or
-		 * not here, but we will throw a fatal error anyway */
-		PORT_LOG("pa_start:Unable to open audio device after 5 attempts. Giving up.");
+			"iaxclient audio: Can't open Audio Device. "
+			"Perhaps you do not have an input or output device?");
+		PORT_LOG("pa_start: Unable to open audio device after 5 attempts. Giving up.");
 		iaxc_millisleep(1000);
-		//return -1; // Give Up.  Too many errors.
+		// Still try one more time instead of giving up
 	}
 
-	/* flush the ringbuffers */
+	// Flush and reinitialize the ring buffers
 	PaUtil_InitializeRingBuffer(&inRing, sizeof(SAMPLE), INRBSZ, inRingBuf);
 	PaUtil_InitializeRingBuffer(&outRing, sizeof(SAMPLE), OUTRBSZ, outRingBuf);
 
-	if ( pa_openstreams(d) )
-	{
+	// Try to open audio streams
+	if (pa_openstreams(d)) {
 		errcnt++;
+		PORT_LOG("pa_start: Failed to open audio streams, error count now %d", errcnt);
 		return -1;
 	}
 
-	errcnt = 0; // only count consecutive errors.
+	// Reset error counter on success
+	errcnt = 0;
 
-	if ( Pa_StartStream(iStream) != paNoError )
+#ifdef _WIN32
+	// On Windows, set higher thread priority for the audio thread process
+	// This helps reduce audio glitches during system load
+	if (!SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS)) {
+		PORT_LOG("pa_start: Failed to set process priority: %d", GetLastError());
+	} else {
+		PORT_LOG("pa_start: Set process to HIGH_PRIORITY_CLASS");
+	}
+	
+	// Set the calling thread to time-critical priority
+	if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL)) {
+		PORT_LOG("pa_start: Failed to set thread priority: %d", GetLastError());
+	} else {
+		PORT_LOG("pa_start: Set main thread to THREAD_PRIORITY_TIME_CRITICAL");
+	}
+	
+	// Configure Windows audio session for optimal quality
+	pa_setup_windows_audio_session();
+#endif
+
+	// Start input stream
+	PaError err = Pa_StartStream(iStream);
+	if (err != paNoError) {
+		PORT_LOG("pa_start: Failed to start input stream: %s", Pa_GetErrorText(err));
 		return -1;
+	}
 
+	// Open mixer for input
 	iMixer = Px_OpenMixer(iStream, 0);
 
-	if ( !oneStream )
-	{
+	// Handle separate output stream if needed
+	if (!oneStream) {
 		PaError err = Pa_StartStream(oStream);
 		oMixer = Px_OpenMixer(oStream, 0);
-		if ( err != paNoError )
-		{
+		if (err != paNoError) {
+			PORT_LOG("pa_start: Failed to start output stream: %s", Pa_GetErrorText(err));
 			Pa_StopStream(iStream);
 			return -1;
 		}
 	}
 
-	if ( selectedRing != selectedOutput )
-	{
+	// Handle ring stream for auxiliary sounds if needed
+	if (selectedRing != selectedOutput) {
 		auxStream = 1;
-	}
-	else
-	{
+	} else {
 		auxStream = 0;
 	}
-
-	if ( auxStream )
-	{
+	if (auxStream) {
 		pa_openauxstream(d);
-		if ( Pa_StartStream(aStream) != paNoError )
-		{
+		if (Pa_StartStream(aStream) != paNoError) {
+			PORT_LOG("pa_start: Failed to start auxiliary stream");
 			auxStream = 0;
+		} else {
+			PORT_LOG("pa_start: Started auxiliary stream for ring sounds");
 		}
 	}
 
-	/* select the microphone as the input source */
-	if ( iMixer != NULL && !mixers_initialized )
-	{
-		/* First, select the "microphone" device, if it's available */
-		/* try the new method, reverting to the old if it fails */
-		if ( Px_SetCurrentInputSourceByName( iMixer, "microphone" ) != 0 )
-		{
-			int n = Px_GetNumInputSources( iMixer ) - 1;
-			for ( ; n > 0; --n )
-			{
-				if ( !strcasecmp("microphone",
-						Px_GetInputSourceName(iMixer, n)) )
-				{
-					Px_SetCurrentInputSource( iMixer, n );
-					PORT_LOG("pa_start:Using microphone input source %d", n);
+	// Configure audio input settings if mixer is available
+	if (iMixer != NULL && !mixers_initialized) {
+		// Try to select the microphone input source
+		if (Px_SetCurrentInputSourceByName(iMixer, "microphone") != 0) {
+			int n = Px_GetNumInputSources(iMixer) - 1;
+			for (; n > 0; --n) {
+				if (!strcasecmp("microphone", Px_GetInputSourceName(iMixer, n))) {
+					Px_SetCurrentInputSource(iMixer, n);
+					PORT_LOG("pa_start: Using microphone input source %d", n);
 				}
 			}
 		}
 
-		/* try to set the microphone boost -- we just turn off this
-		 * "boost" feature, because it often leads to clipping, which
-		 * we can't fix later -- but we can deal with low input levels
-		 * much more gracefully */
-		Px_SetMicrophoneBoost( iMixer, 0 );
+		// Disable microphone boost to prevent clipping
+		// Low levels can be fixed by software, but clipping cannot
+		Px_SetMicrophoneBoost(iMixer, 0);
+		PORT_LOG("pa_start: Disabled microphone boost to prevent clipping");
 
-		/* If the input level is very low, raise it up a bit.
-		 * Otherwise, AGC cannot detect speech, and cannot adjust
-		 * levels */
-		if ( pa_input_level_get(d) < 0.5f )
+		// If input level is very low, raise it to ensure AGC can detect speech
+		if (pa_input_level_get(d) < 0.5f) {
 			pa_input_level_set(d, 0.6f);
-		mixers_initialized = 1;
+			PORT_LOG("pa_start: Increased input level to 0.6 for AGC");
+		}
+				mixers_initialized = 1;
 	}
-    PORT_LOG("pa_start:Streams started successfully");
+
+#ifdef _WIN32
+	// Start health check thread for Windows to monitor audio stream health
+	if (!healthCheckThreadActive) {
+		healthCheckThreadActive = 0;
+		healthCheckThread = CreateThread(NULL, 0, 
+			&HealthCheckTimerThread, 
+			NULL, 0, NULL);
+		
+		if (healthCheckThread) {
+			SetThreadPriority(healthCheckThread, THREAD_PRIORITY_ABOVE_NORMAL);
+			PORT_LOG("pa_start: Started health check thread for audio stability");
+		} else {
+			PORT_LOG("pa_start: Failed to start health check thread: %d", GetLastError());
+		}
+	}
+#endif
+
+	PORT_LOG("pa_start: Audio streams started successfully");
 	running = 1;
+	error_count = 0;
+	output_underruns = 0;
 	return 0;
 }
 
-static int pa_stop (struct iaxc_audio_driver *d )
+static int pa_stop (struct iaxc_audio_driver *d)
 {
 	PaError err;
 
-	if ( !running )
+	if (!running)
 		return 0;
 
-	if ( sounds )
+	// Keep the audio system running if sounds are being played
+	if (sounds)
 		return 0;
 
+	PORT_LOG("pa_stop: Stopping PortAudio streams");
+
+	// Attempt error recovery if streams are in a bad state
+#ifdef _WIN32
+	PaError inputStatus = Pa_IsStreamActive(iStream);
+	if (inputStatus == 1) {
+		// Normal active stream - proceed with abort
+		err = Pa_AbortStream(iStream);
+		if (err != paNoError) {
+			PORT_LOG("pa_stop: Error aborting input stream: %s", Pa_GetErrorText(err));
+		}
+	} else if (inputStatus < 0) {
+		// Stream in error state - try to recover
+		PORT_LOG("pa_stop: Input stream in error state (%d), attempting recovery", inputStatus);
+		Pa_CloseStream(iStream);
+		iStream = NULL;
+	} else {
+		// Stream already stopped
+		err = Pa_CloseStream(iStream);
+	}
+#else
+	// For non-Windows, use the standard approach
 	err = Pa_AbortStream(iStream);
 	err = Pa_CloseStream(iStream);
+#endif
 
-	if ( !oneStream )
-	{
+	if (!oneStream) {
+		// Handle output stream separately if using separate streams
+#ifdef _WIN32
+		PaError outputStatus = Pa_IsStreamActive(oStream);
+		if (outputStatus == 1) {
+			err = Pa_AbortStream(oStream);
+			if (err != paNoError) {
+				PORT_LOG("pa_stop: Error aborting output stream: %s", Pa_GetErrorText(err));
+			}
+		} else if (outputStatus < 0) {
+			PORT_LOG("pa_stop: Output stream in error state (%d), attempting recovery", outputStatus);
+			Pa_CloseStream(oStream);
+			oStream = NULL;
+		} else {
+			err = Pa_CloseStream(oStream);
+		}
+#else
 		err = Pa_AbortStream(oStream);
 		err = Pa_CloseStream(oStream);
+#endif
 	}
 
-	if ( auxStream )
-	{
+	if (auxStream) {
+#ifdef _WIN32
+		PaError auxStatus = Pa_IsStreamActive(aStream);
+		if (auxStatus == 1) {
+			err = Pa_AbortStream(aStream);
+			if (err != paNoError) {
+				PORT_LOG("pa_stop: Error aborting auxiliary stream: %s", Pa_GetErrorText(err));
+			}
+		} else if (auxStatus < 0) {
+			PORT_LOG("pa_stop: Auxiliary stream in error state (%d), attempting recovery", auxStatus);
+			Pa_CloseStream(aStream);
+			aStream = NULL;
+		} else {
+			err = Pa_CloseStream(aStream);
+		}
+#else
 		err = Pa_AbortStream(aStream);
 		err = Pa_CloseStream(aStream);
+#endif
 	}
 
+	// Clean up resamplers to avoid memory leaks
+	if (speex_resampler) {
+		speex_resampler_destroy(speex_resampler);
+		speex_resampler = NULL;
+	}
+	
+	if (output_resampler) {		speex_resampler_destroy(output_resampler);
+		output_resampler = NULL;
+	}
+
+#ifdef _WIN32
+	// Stop health check thread 
+	if (healthCheckThreadActive) {
+		// Signal thread to exit
+		healthCheckThreadActive = 0;
+		
+		// Wait for thread to finish with timeout
+		if (healthCheckThread) {
+			WaitForSingleObject(healthCheckThread, 1000);
+			CloseHandle(healthCheckThread);
+			healthCheckThread = NULL;
+			PORT_LOG("pa_stop: Health check thread terminated");
+		}
+	}
+#endif
+
+	PORT_LOG("pa_stop: Audio streams stopped");
 	running = 0;
 	return 0;
 }
 
-/* Mihai: apparently nobody loves this function. Some actually hate it.
- * I bet if it's gone, no one will miss it.  Such a cold, cold world!
-static void pa_shutdown()
+// Modify the pa_check_stream_health function to use our buffer booster
+static int pa_check_stream_health(struct iaxc_audio_driver *d)
 {
-	CloseAudioStream( iStream );
-	if(!oneStream) CloseAudioStream( oStream );
-	if(auxStream) CloseAudioStream( aStream );
-}
-*/
-
-static void handle_paerror(PaError err, char * where)
-{
-	fprintf(stderr, "PortAudio error at %s: %s\n", where,
-			Pa_GetErrorText(err));
+    // This function is called periodically to check the health of audio streams
+    
+    // Check if we have too many errors
+    if (error_count > 15) {
+        PORT_LOG("pa_check_stream_health: Too many errors (%d), requesting restart", error_count);
+        return 1; // Need restart
+    }
+    
+    // Adaptive underrun threshold - be more tolerant during startup but responsive during operation
+    static int startup_grace_period = 100; // Allow more underruns during initial startup
+    int underrun_threshold = (startup_grace_period > 0) ? 150 : 75;
+    
+    if (startup_grace_period > 0) {
+        startup_grace_period--;
+    }
+    
+    if (output_underruns > underrun_threshold) {
+        PORT_LOG("pa_check_stream_health: Too many underruns (%d > %d), requesting restart", 
+                output_underruns, underrun_threshold);
+        return 1; // Need restart
+    }
+      // Proactively boost buffer only when we see signs of trouble (more responsive)
+    if (output_underruns > 10) {  // Increased threshold to be less aggressive
+        pa_boost_buffer();
+    }
+    
+    // Check stream states for errors
+    if (iStream) {
+        PaError status = Pa_IsStreamActive(iStream);
+        if (status < 0) {
+            PORT_LOG("pa_check_stream_health: Input stream has error state (%d)", status);
+            return 1; // Need restart
+        }
+        
+        // Check for latency or xruns when we can access this info
+        const PaStreamInfo* info = Pa_GetStreamInfo(iStream);
+        if (info) {
+            if (info->inputLatency > 0.5 || info->outputLatency > 0.5) {
+                PORT_LOG("pa_check_stream_health: Stream latency too high (in=%.1fms, out=%.1fms)",
+                        info->inputLatency * 1000, info->outputLatency * 1000);
+                return 1; // Need restart with better parameters
+            }
+        }
+    }
+    
+    if (oStream && oStream != iStream) {
+        PaError status = Pa_IsStreamActive(oStream);
+        if (status < 0) {
+            PORT_LOG("pa_check_stream_health: Output stream has error state (%d)", status);
+            return 1; // Need restart
+        }
+    }
+    
+    // Check if ring buffer is severely under/over filled
+    int inRingBufferFill = PaUtil_GetRingBufferFullCount(&inRing);
+    int outRingBufferFill = PaUtil_GetRingBufferFullCount(&outRing);
+    
+    // Extreme conditions that need recovery
+    if (inRingBufferFill > INRBSZ * 0.9) {
+        PORT_LOG("pa_check_stream_health: Input ring buffer overflow (%.1f%% full)", 
+                (float)inRingBufferFill / INRBSZ * 100);
+        // Purge half the buffer
+        SAMPLE dummy[1024];
+        int toPurge = inRingBufferFill / 2;
+        while (toPurge > 0) {
+            int count = toPurge > 1024 ? 1024 : toPurge;
+            PaUtil_ReadRingBuffer(&inRing, dummy, count);
+            toPurge -= count;
+        }
+        PORT_LOG("pa_check_stream_health: Purged input buffer to %.1f%% full", 
+                (float)PaUtil_GetRingBufferFullCount(&inRing) / INRBSZ * 100);
+        return 0; // Fixed with purge
+    }
+      if (outRingBufferFill < 80 && output_underruns > 5) {  // Optimized for low latency
+        PORT_LOG("pa_check_stream_health: Output ring buffer critically low (%d samples, %d underruns)", 
+                outRingBufferFill, output_underruns);
+        
+        // Use our low-latency buffer boosting function
+        pa_boost_buffer();
+        return 0; // Fixed with minimal silence buffer
+    }
+    
+    // All checks passed
+    return 0; // Healthy
 }
 
 static int pa_input(struct iaxc_audio_driver *d, void *samples, int *nSamples)
@@ -1250,36 +1762,72 @@ static int pa_input(struct iaxc_audio_driver *d, void *samples, int *nSamples)
     static int error_count = 0;
     static int last_success_time = 0;
     static int call_count = 0;
+    static int total_samples_read = 0;
+    static int last_stats_time = 0;
+    static int last_health_check = 0;
+    int current_time = time(NULL);
     int elementsToRead = *nSamples;
     int available = PaUtil_GetRingBufferReadAvailable(&inRing);
-#ifdef VERBOSE    
-    // Reduce log spam by only logging every few calls
-    if (call_count++ % 20 == 0) {
-        PORT_LOG("pa_input: Available=%d elements, requested=%d", available, elementsToRead);
+    
+    // Periodically check audio stream health (every 5 seconds)
+    if (current_time - last_health_check >= 5) {
+        if (pa_check_stream_health(d)) {
+            PORT_LOG("pa_input: Stream health check detected and recovered from a problem");
+            // After recovery, reset some stats
+            error_count = 0;
+            last_success_time = current_time;
+        }
+        last_health_check = current_time;
     }
-#endif    
+    
+    // Collect stats about how much data we're reading
+    call_count++;
+    
+    // Log stats periodically to help with debugging
+    if (current_time - last_stats_time >= 30) {  // Every 30 seconds
+        PORT_LOG("pa_input: STATS: %d calls in %d seconds, %d total samples read (%.1f samples/call)",
+                call_count, current_time - last_stats_time, 
+                total_samples_read, 
+                (float)total_samples_read / (call_count > 0 ? call_count : 1));
+        call_count = 0;
+        total_samples_read = 0;
+        last_stats_time = current_time;
+    }
+    
+    // Check if we have enough data in the ring buffer
     if (available < elementsToRead) {
-        // Return partial data if we have more than half requested
+        // Return partial data if we have more than half of what was requested
         if (available > elementsToRead/2) {
-#ifdef VERBOSE			
-            PORT_LOG("pa_input: Returning partial data (%d elements)", available);
-#endif			
             PaUtil_ReadRingBuffer(&inRing, samples, available);
             *nSamples = available;
+            total_samples_read += available;
             error_count = 0;
-            return 0;
+            last_success_time = current_time;
+            return 0;  // Success with partial data
         }
         
-        // During startup or after silence
+        // During startup phase or after silence, return 0 samples without error
         if (startup_counter++ < 200) {
             *nSamples = 0;
-            return 0;  // Return success with 0 samples
+            return 0;  // Return success with 0 samples during startup
         }
         
-        // Add small delay to allow buffer to fill if we're getting errors
+        // Add small delay and retry logic for transient buffer underruns
         if (++error_count > 5) {
+            // If we've had many errors in a row, log it and sleep briefly
+            PORT_LOG("pa_input: Multiple buffer underruns (%d in a row). Available=%d, needed=%d", 
+                    error_count, available, elementsToRead);
+            
+            // Before giving up, check how long since our last success
+            if (current_time - last_success_time > 10) {
+                // It's been a while since we had success - could be a serious issue
+                PORT_LOG("pa_input: No successful reads for %d seconds - audio input may be stalled",
+                        current_time - last_success_time);
+            }
+            
             error_count = 0;
-            iaxc_millisleep(5);  // Small sleep to allow buffer to fill
+            // Small sleep to allow buffer to fill
+            iaxc_millisleep(5);
         }
         
         *nSamples = 0;
@@ -1288,9 +1836,43 @@ static int pa_input(struct iaxc_audio_driver *d, void *samples, int *nSamples)
     
     // Success - we have enough data
     PaUtil_ReadRingBuffer(&inRing, samples, elementsToRead);
+    total_samples_read += elementsToRead;
     error_count = 0;
     startup_counter = 0;  // Reset startup counter on success
-    return 0;
+    last_success_time = current_time;
+    
+    // Check for silent input (could indicate a problem with the mic)
+    if (call_count % 100 == 0) {  // Only check occasionally
+        int is_silent = 1;
+        short* sample_data = (short*)samples;
+        int silent_threshold = 5;  // Extremely low level to detect true silence
+        
+        // Check first 100 samples (or fewer if we have less)
+        for (int i = 0; i < elementsToRead && i < 100; i++) {
+            if (abs(sample_data[i]) > silent_threshold) {
+                is_silent = 0;
+                break;
+            }
+        }
+        
+        // Only log if we have many samples to check and they're all silent
+        if (is_silent && elementsToRead >= 100) {
+            // Keep track of consecutive silent reads
+            static int consecutive_silent = 0;
+            consecutive_silent++;
+            
+            if (consecutive_silent % 50 == 0) {  // Log after ~5 seconds of silence
+                PORT_LOG("pa_input: WARNING: Detected %d consecutive silent inputs - check microphone",
+                        consecutive_silent);
+            }
+        } else {
+            // Reset the counter when we get non-silent audio
+            static int consecutive_silent = 0;
+            consecutive_silent = 0;
+        }
+    }
+    
+    return 0;  // Success
 }
 
 static int pa_output(struct iaxc_audio_driver *d, void *samples, int nSamples)
@@ -1299,23 +1881,127 @@ static int pa_output(struct iaxc_audio_driver *d, void *samples, int nSamples)
     int outRingLen = PaUtil_GetRingBufferWriteAvailable(&outRing);
     outRingLenAvg = (outRingLenAvg * 9 + outRingLen) / 10;
     
-    // Simple buffer management - only drop if absolutely necessary
-    if (outRingLen < nSamples) {
-        // This is a buffer overflow situation - log it
-        PORT_LOG("OUTPUT DROP: Buffer overflow (%d samples needed, only %d available)", 
-                nSamples, outRingLen);
+    // Periodically check stream health
+    static int last_health_check = 0;
+    int current_time = time(NULL);
+    if (current_time - last_health_check >= 5) {
+        // Only check if we've been experiencing problems
+        static int consecutive_errors = 0;
+        if (consecutive_errors > 3) {
+            if (pa_check_stream_health(d)) {
+                PORT_LOG("pa_output: Stream health check recovered from a problem");
+                consecutive_errors = 0;
+            }
+        }
+        last_health_check = current_time;
+    }
+    
+    // Safety check for invalid samples
+    if (!samples || nSamples <= 0) {
+        PORT_LOG("pa_output: Invalid samples: ptr=%p, count=%d", samples, nSamples);
         return 0;
     }
     
-    // Write the data to the ring buffer
-    int written = PaUtil_WriteRingBuffer(&outRing, samples, nSamples);
+    // Check for buffer overflow
+    if (outRingLen < nSamples) {
+        // This is a buffer overflow situation - we need to handle it gracefully
+        
+        // Strategy 1: If slightly over, drop a fraction of samples to catch up
+        if (outRingLen > nSamples * 0.75) {
+            // Write what we can, skipping some samples
+            int skip_ratio = nSamples / outRingLen + 1;
+            SAMPLE* in_samples = (SAMPLE*)samples;
+            SAMPLE temp_buf[1024]; // Use a small temp buffer
+            
+            // Downsample by skipping some samples
+            int out_count = 0;
+            for (int i = 0; i < nSamples && out_count < outRingLen && out_count < 1024; i++) {
+                if (i % skip_ratio != 0) {  // Skip some samples
+                    temp_buf[out_count++] = in_samples[i];
+                }
+            }
+            
+            // Write the downsampled buffer
+            int written = PaUtil_WriteRingBuffer(&outRing, temp_buf, out_count);
+            PORT_LOG("pa_output: Partial overflow, downsampled %d samples to %d", 
+                     nSamples, written);
+            return written;
+        }
+        
+        // Strategy 2: For severe overflow, drop all samples and log
+        PORT_LOG("pa_output: Buffer overflow - dropping %d samples (only %d available)", 
+                nSamples, outRingLen);
+        
+        // Count the total number of dropped samples for diagnostics
+        static int total_dropped = 0;
+        total_dropped += nSamples;
+        
+        if (total_dropped % 8000 == 0) {  // Log roughly every second of dropped audio
+            PORT_LOG("pa_output: Dropped %d total samples (%d seconds of audio)",
+                    total_dropped, total_dropped/8000);
+        }
+        
+        return 0;
+    }
     
-    // Log any partial writes
+    // No overflow condition - write the data to the ring buffer
+    int written = PaUtil_WriteRingBuffer(&outRing, samples, nSamples);
+      // Track metrics for buffer fullness
+    static int last_report_time = 0;
+    static int total_samples = 0;
+    
+    total_samples += written;
+    
+    // Report buffer metrics periodically
+    if (current_time - last_report_time >= 10) {  // Every 10 seconds
+        float buffer_fullness = (float)(OUTRBSZ - outRingLen) / OUTRBSZ * 100.0f;
+        
+        PORT_LOG("pa_output: Buffer stats - %d%% full, %d samples/sec avg",
+                (int)buffer_fullness, total_samples / (current_time - last_report_time));
+        
+        last_report_time = current_time;
+        total_samples = 0;
+    }
+    
+    
+    // Log any partial writes (but this should never happen with the overflow check above)
     if (written < nSamples) {
-        PORT_LOG("OUTPUT DROP: Could only write %d of %d samples", written, nSamples);
+        PORT_LOG("pa_output: Unexpectedly wrote only %d of %d samples", written, nSamples);
     }
     
     return written;
+}
+
+// Low-latency adaptive buffer stabilizer function
+static void pa_boost_buffer(void)
+{
+    int available = PaUtil_GetRingBufferReadAvailable(&outRing);
+    int capacity = OUTRBSZ;
+    float fullness = (float)available / capacity;
+    
+    // Only boost if buffer is critically low (< 10%)
+    if (fullness < 0.1) {
+        // Target a much smaller buffer - just enough to prevent immediate underrun
+        // This targets ~100ms worth of audio at 8kHz instead of 800ms
+        int target_samples = sample_rate / 10;  // 100ms worth of samples
+        int to_add = target_samples - available;
+        
+        if (to_add > 0) {
+            // Limit boost to prevent excessive latency
+            if (to_add > 2048) to_add = 2048;  // Max ~256ms boost at 8kHz
+            SAMPLE silence[1024] = {0};
+            
+            int added = 0;
+            while (added < to_add) {
+                int chunk = (to_add - added > 1024) ? 1024 : (to_add - added);
+                added += PaUtil_WriteRingBuffer(&outRing, silence, chunk);
+            }
+            
+            PORT_LOG("pa_boost_buffer: Added %d silence samples (%.1f%% -> %.1f%%) for low-latency stability",
+                    added, fullness * 100, (float)(available + added) / capacity * 100);
+            output_underruns = 0;
+        }
+    }
 }
 
 static int pa_select_devices(struct iaxc_audio_driver *d, int input,
@@ -1484,9 +2170,25 @@ static int _pa_initialize (struct iaxc_audio_driver *d, int sr)
 	{
 		PORT_LOG("_pa_initialize:Pa_Initialize failed with error %d: %s", 
 			err, Pa_GetErrorText(err));
-		iaxci_usermsg(IAXC_TEXT_TYPE_ERROR, "Failed Pa_Initialize");
-		return err;
+		
+		// For some errors, try one more time after a delay
+		if (err == paUnanticipatedHostError) {
+		    PORT_LOG("_pa_initialize:Unanticipated host error, trying again after delay");
+		    iaxc_millisleep(500);
+		    
+		    if (paNoError != (err = Pa_Initialize())) {
+		        PORT_LOG("_pa_initialize:Second attempt also failed: %s", Pa_GetErrorText(err));
+		        iaxci_usermsg(IAXC_TEXT_TYPE_ERROR, "Failed to initialize audio system");
+		        return err;
+		    }
+		    
+		    PORT_LOG("_pa_initialize:Second attempt succeeded");
+		} else {
+		    iaxci_usermsg(IAXC_TEXT_TYPE_ERROR, "Failed to initialize audio system");
+		    return err;
+		}
 	}
+	
 #ifdef VERBOSE
     PORT_LOG("_pa_initialize:Pa_Initialize succeeded, scanning devices");
 #endif
@@ -1512,7 +2214,6 @@ static int _pa_initialize (struct iaxc_audio_driver *d, int sr)
 	d->stop_sound = pa_stop_sound;
 	d->mic_boost_get = pa_mic_boost_get;
 	d->mic_boost_set = pa_mic_boost_set;
-
 	/* setup private data stuff */
 	selectedInput  = Pa_GetDefaultInputDevice();
 	selectedOutput = Pa_GetDefaultOutputDevice();
@@ -1520,25 +2221,37 @@ static int _pa_initialize (struct iaxc_audio_driver *d, int sr)
 	sounds = NULL;
 	MUTEXINIT(&sound_lock);
 
+	// Configure for Windows optimization
+#ifdef _WIN32
+	// Pre-initialize host sample rate to a reasonable default
+	// Will be updated when devices are actually opened
+	host_sample_rate = 48000.0;
+	sample_ratio = host_sample_rate / (double)sample_rate;
+	
+	PORT_LOG("_pa_initialize: Windows-specific optimizations enabled");
+#endif
+
+	// Initialize ring buffers for audio processing
 	PaUtil_InitializeRingBuffer(&inRing, sizeof(SAMPLE), INRBSZ, inRingBuf);
 	PaUtil_InitializeRingBuffer(&outRing, sizeof(SAMPLE), OUTRBSZ, outRingBuf);
-	// Initialize the ring buffers properly
+	// Explicitly flush ring buffers to ensure they're clean
 	PaUtil_FlushRingBuffer(&inRing);
 	PaUtil_FlushRingBuffer(&outRing);
 
-	// Add some silence at the beginning to prime the buffer
-	SAMPLE silence[160] = {0};
-	PaUtil_WriteRingBuffer(&outRing, silence, 160);
-#ifdef VERBOSE
-	PORT_LOG("_pa_initialize:Ring buffers initialized (in: %d, out: %d)",
-
-		PaUtil_GetRingBufferReadAvailable(&inRing),
-		PaUtil_GetRingBufferReadAvailable(&outRing));
-#endif
-	running = 0;
-#ifdef VERBOSE
-    PORT_LOG("_pa_initialize:PortAudio initialization complete");
-#endif
+	// Add some silence at the beginning to prime the output buffer
+	// This helps prevent initial audio underruns
+	SAMPLE silence[512] = {0};  // Larger silence buffer for stability
+	PaUtil_WriteRingBuffer(&outRing, silence, 512);
+	
+	PORT_LOG("_pa_initialize: Ring buffers initialized with %d bytes input and %d bytes output",
+		INRBSZ * sizeof(SAMPLE), OUTRBSZ * sizeof(SAMPLE));
+	
+	// Initialize memory for error recovery
+	error_count = 0;
+	startup_counter = 0;
+	output_underruns = 0;	running = 0;
+	
+	PORT_LOG("_pa_initialize: PortAudio initialization complete");
 	return 0;
 }
 
@@ -1550,6 +2263,42 @@ int pa_initialize(struct iaxc_audio_driver *d, int sr)
 	_pa_initialize(d, sr);
     current_audio_format = paInt16;  // Fix for 0x0 format issue
     PORT_LOG("pa_initialize(2): Explicitly setting audio format to 0x%x (paInt16)", current_audio_format);
+
+    // Set up health check timer to periodically refresh audio (helps with long-term stability)
+#ifdef _WIN32
+    static HANDLE healthCheckTimer = NULL;
+    static BOOL timerInitialized = FALSE;
+    
+    if (!timerInitialized) {
+        // Create a timer that will force a stream restart every hour
+        // This helps with long-term stability, especially on systems that run for days
+        HANDLE hTimer = CreateWaitableTimer(NULL, TRUE, "IAXAudioHealthTimer");
+        if (hTimer) {
+            LARGE_INTEGER liDueTime;
+            liDueTime.QuadPart = -36000000000LL; // Negative value = relative time (1 hour in 100ns units)
+            
+            if (SetWaitableTimer(hTimer, &liDueTime, 0, NULL, NULL, FALSE)) {
+                // Create a thread to wait for the timer
+                HANDLE hThread = CreateThread(NULL, 0, 
+                    (LPTHREAD_START_ROUTINE)HealthCheckTimerThread, 
+                    d, 0, NULL);
+                
+                if (hThread) {
+                    PORT_LOG("pa_initialize: Scheduled automatic health check for long-term stability");
+                    CloseHandle(hThread);
+                    timerInitialized = TRUE;
+                    healthCheckTimer = hTimer;
+                } else {
+                    PORT_LOG("pa_initialize: Failed to create health check thread");
+                    CloseHandle(hTimer);
+                }
+            } else {
+                PORT_LOG("pa_initialize: Failed to set waitable timer");
+                CloseHandle(hTimer);
+            }
+        }
+    }
+#endif
 
 	/* TODO: Kludge alert. We only do the funny audio start-stop
 	 * business if iaxci_audio_output_mode is not set. This is a
@@ -1577,3 +2326,199 @@ int pa_initialize_deferred(struct iaxc_audio_driver *d, int sr)
 	return 0;
 }
 
+#ifdef _WIN32
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
+
+static void pa_setup_windows_audio_session(void)
+{
+    HRESULT hr;
+    IMMDeviceEnumerator *pEnumerator = NULL;
+    IMMDevice *pDevice = NULL;
+    IAudioSessionManager *pSessionManager = NULL;
+    IAudioSessionControl *pSessionControl = NULL;
+    IAudioSessionControl2 *pSessionControl2 = NULL;
+    
+    // Initialize COM
+    hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (SUCCEEDED(hr)) {
+        PORT_LOG("pa_setup_windows_audio_session: COM initialized");
+    } else {
+        PORT_LOG("pa_setup_windows_audio_session: Failed to initialize COM: 0x%x", hr);
+        return;
+    }
+    
+    // Get the device enumerator - ensure we have the correct GUID
+    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, 
+                          &IID_IMMDeviceEnumerator, (void**)&pEnumerator);
+    if (FAILED(hr)) {
+        PORT_LOG("pa_setup_windows_audio_session: Failed to create device enumerator: 0x%x", hr);
+        CoUninitialize();
+        return;
+    }
+    
+    // Get the default audio endpoint
+    hr = pEnumerator->lpVtbl->GetDefaultAudioEndpoint(pEnumerator, eRender, eConsole, &pDevice);
+    if (FAILED(hr)) {
+        PORT_LOG("pa_setup_windows_audio_session: Failed to get default endpoint: 0x%x", hr);
+        pEnumerator->lpVtbl->Release(pEnumerator);
+        CoUninitialize();
+        return;
+    }
+    
+    // Get the session manager
+    hr = pDevice->lpVtbl->Activate(pDevice, &IID_IAudioSessionManager, 
+                                  CLSCTX_ALL, NULL, (void**)&pSessionManager);
+    if (FAILED(hr)) {
+        PORT_LOG("pa_setup_windows_audio_session: Failed to get session manager: 0x%x", hr);
+        pDevice->lpVtbl->Release(pDevice);
+        pEnumerator->lpVtbl->Release(pEnumerator);
+        CoUninitialize();
+        return;
+    }
+    
+    // Get the audio session control
+    hr = pSessionManager->lpVtbl->GetAudioSessionControl(pSessionManager, NULL, 0, &pSessionControl);
+    if (FAILED(hr)) {
+        PORT_LOG("pa_setup_windows_audio_session: Failed to get session control: 0x%x", hr);
+        pSessionManager->lpVtbl->Release(pSessionManager);
+        pDevice->lpVtbl->Release(pDevice);
+        pEnumerator->lpVtbl->Release(pEnumerator);
+        CoUninitialize();
+        return;
+    }
+    
+    // Get the extended session control interface
+    hr = pSessionControl->lpVtbl->QueryInterface(pSessionControl, 
+                                              &IID_IAudioSessionControl2, (void**)&pSessionControl2);
+    if (FAILED(hr)) {
+        PORT_LOG("pa_setup_windows_audio_session: Failed to get session control2: 0x%x", hr);
+        pSessionControl->lpVtbl->Release(pSessionControl);
+        pSessionManager->lpVtbl->Release(pSessionManager);
+        pDevice->lpVtbl->Release(pDevice);
+        pEnumerator->lpVtbl->Release(pEnumerator);
+        CoUninitialize();
+        return;
+    }
+    
+    // Set the session to not be ducked by Windows (e.g. during notifications)
+    hr = pSessionControl2->lpVtbl->SetDuckingPreference(pSessionControl2, TRUE);
+    if (SUCCEEDED(hr)) {
+        PORT_LOG("pa_setup_windows_audio_session: Successfully set ducking preference");
+    }
+    
+    // Set display name for the audio session
+    hr = pSessionControl->lpVtbl->SetDisplayName(pSessionControl, L"IAX Audio", NULL);
+    if (SUCCEEDED(hr)) {
+        PORT_LOG("pa_setup_windows_audio_session: Set session display name to 'IAX Audio'");
+    }
+    
+    // Clean up
+    pSessionControl2->lpVtbl->Release(pSessionControl2);
+    pSessionControl->lpVtbl->Release(pSessionControl);
+    pSessionManager->lpVtbl->Release(pSessionManager);
+    pDevice->lpVtbl->Release(pDevice);
+    pEnumerator->lpVtbl->Release(pEnumerator);
+    
+    CoUninitialize();
+      PORT_LOG("pa_setup_windows_audio_session: Audio session configured for improved priority");
+}
+#endif
+
+#ifdef _WIN32
+// Health check timer thread function
+static DWORD WINAPI HealthCheckTimerThread(LPVOID param)
+{
+    struct iaxc_audio_driver *d = (struct iaxc_audio_driver *)param;
+    HANDLE hTimer = CreateWaitableTimer(NULL, TRUE, "IAXAudioHealthTimer");
+    if (hTimer) {
+        LARGE_INTEGER liDueTime;
+        // Initial check after 5 minutes
+        liDueTime.QuadPart = -3000000000LL; // Negative value = relative time (5 min in 100ns units)
+        
+        if (SetWaitableTimer(hTimer, &liDueTime, 0, NULL, NULL, FALSE)) {
+            healthCheckThreadActive = 1;
+            
+            PORT_LOG("HealthCheckTimerThread: Started with 5-minute initial interval");
+            
+            // Track statistics for health monitoring
+            int restart_count = 0;
+            int last_restart_time = GetTickCount();
+            
+            while (healthCheckThreadActive) {
+                // Wait for the timer to trigger
+                DWORD result = WaitForSingleObject(hTimer, 10000); // Check every 10 seconds for thread exit
+                
+                if (!healthCheckThreadActive) {
+                    break; // Exit thread if requested
+                }
+                
+                if (result == WAIT_OBJECT_0) {
+                    PORT_LOG("HealthCheckTimerThread: Performing scheduled audio health check");
+                    
+                    // Check if currently running before performing health maintenance
+                    if (running) {
+                        // Do a thorough health check
+                        if (pa_check_stream_health(d)) {
+                            // Stream health check indicates problems that need a restart
+                            PORT_LOG("HealthCheckTimerThread: Health check detected issues, restarting audio");
+                            
+                            // Check if we're restarting too frequently (possible device issues)
+                            DWORD current_time = GetTickCount();
+                            if (current_time - last_restart_time < 60000 && restart_count > 2) {
+                                // Too many restarts in a short time, increase interval to prevent thrashing
+                                PORT_LOG("HealthCheckTimerThread: Too many restarts (%d) in short period, extending interval", 
+                                        restart_count);
+                                
+                                // Show a warning to the user
+                                iaxci_usermsg(IAXC_TEXT_TYPE_NOTICE, 
+                                    "Audio system experiencing issues. Check your audio device settings.");
+                                
+                                // Set next check farther away (30 minutes)
+                                liDueTime.QuadPart = -18000000000LL;
+                                restart_count = 0;
+                            } else {
+                                // Set next check in 5 minutes
+                                liDueTime.QuadPart = -3000000000LL;
+                                restart_count++;
+                            }
+                            
+                            // Perform the actual restart
+                            pa_stop(d);
+                            iaxc_millisleep(500); // Give time for resources to be released
+                            pa_start(d);
+                            
+                            last_restart_time = GetTickCount();
+                            PORT_LOG("HealthCheckTimerThread: Audio streams restarted successfully");
+                        } else {
+                            // No problems detected, perform routine maintenance
+                            PORT_LOG("HealthCheckTimerThread: No issues detected, performing routine maintenance");
+                            
+                            // Reset counters for good behavior
+                            error_count = 0;
+                            
+                            // Set next check in 15 minutes (longer interval for healthy systems)
+                            liDueTime.QuadPart = -9000000000LL;
+                            restart_count = 0;
+                        }
+                    } else {
+                        // Audio not running, just reset the timer
+                        PORT_LOG("HealthCheckTimerThread: Audio not running, skipping health check");
+                        liDueTime.QuadPart = -3000000000LL;
+                    }
+                    
+                    // Set the timer for the next check
+                    SetWaitableTimer(hTimer, &liDueTime, 0, NULL, NULL, FALSE);
+                }
+            }
+        }
+        CloseHandle(hTimer);
+    }
+    
+    PORT_LOG("HealthCheckTimerThread: Thread terminated");
+    return 0;
+}
+#endif

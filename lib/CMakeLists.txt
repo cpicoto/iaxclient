@@ -141,17 +141,26 @@ endif()
 
 # Add additional libraries needed for static linking with PortAudio
 if(WIN32)
-    set(PLATFORM_LIBS ${PLATFORM_LIBS} 
+  set(PLATFORM_LIBS ${PLATFORM_LIBS} 
       setupapi
       ole32
       uuid
+      winmm
+      ksuser
+      avrt
+      mfplat
+      mfuuid
+      wmcodecdspuuid
+      strmiids     # DirectShow interfaces
+      oleaut32     # OLE Automation
+      comdlg32     # Common dialog
     )
+    
+    # Define these flags to properly link the COM GUIDs
+    add_definitions(-DINITGUID -DPSAPI_VERSION=1)
 endif()
 
-# Add setupapi to the linked libraries
-if(WIN32)
-    set(PLATFORM_LIBS ${PLATFORM_LIBS} setupapi)
-endif()
+# Don't add setupapi again as it's already included above
 
 #
 # Link libraries

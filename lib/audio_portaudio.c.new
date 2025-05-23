@@ -1,0 +1,47 @@
+#define AUDIO_ERROR_RECOVERY_CODE
+
+// Add this function after pa_stop and before pa_input
+static int pa_check_stream_health(struct iaxc_audio_driver *d)
+{
+    if (!running) {
+        return 0;  // No active streams, nothing to check
+    }
+    
+    // Check input stream health
+    if (iStream) {
+        PaError inputStatus = Pa_IsStreamActive(iStream);
+        if (inputStatus < 0) {
+            // Stream is in an error state
+            PORT_LOG("pa_check_stream_health: Input stream in error state (%d), attempting restart", 
+                     inputStatus);
+            
+            // Try to stop cleanly
+            Pa_AbortStream(iStream);
+            Pa_CloseStream(iStream);
+            
+            // Try to restart audio
+            pa_stop(d);
+            pa_start(d);
+            
+            return 1;  // We had to recover
+        }
+    }
+    
+    // Check output stream health (if separate)
+    if (!oneStream && oStream) {
+        PaError outputStatus = Pa_IsStreamActive(oStream);
+        if (outputStatus < 0) {
+            // Stream is in an error state
+            PORT_LOG("pa_check_stream_health: Output stream in error state (%d), attempting restart", 
+                     outputStatus);
+            
+            // Try to stop cleanly
+            pa_stop(d);
+            pa_start(d);
+            
+            return 1;  // We had to recover
+        }
+    }
+    
+    return 0;  // No recovery needed
+}
