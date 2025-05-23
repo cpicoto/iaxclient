@@ -385,3 +385,5 @@ lib/audio_encode.c
 /.vs/iaxclient/v17/Preview
 /.vs/iaxclient/v17
 /.vs
+/lib/.vs
+/lib/out/build/x64-Debug
