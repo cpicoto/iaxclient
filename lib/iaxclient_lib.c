@@ -1228,8 +1228,10 @@ static void iaxc_handle_network_event(struct iax_event *e, int callNo)
         calls[callNo].state &= ~IAXC_CALL_STATE_RINGING;
         calls[callNo].state |=  IAXC_CALL_STATE_COMPLETE;
         iaxci_do_state_callback(callNo);
+#ifdef VERBOSE
         iaxci_usermsg(IAXC_STATUS, "Call %d answered (Authentication succeeded)",
                       callNo);
+#endif
         break;
 
     case IAX_EVENT_BUSY:
@@ -1335,9 +1337,11 @@ static void iaxc_handle_network_event(struct iax_event *e, int callNo)
             IAX_LOG("iaxc_handle_network_event:Using registration: user='%s', host='%s'",
                        reg->user, reg->host);
             iax_auth_reply(e->session, reg->pass, e->ies.challenge, 2);
+#ifdef VERBOSE
             iaxci_usermsg(IAXC_STATUS,
                           "iaxc_handle_network_event:AUTH reply sent for call %d using registration '%s'",
                           callNo, reg->user);
+#endif
         }
         break;
     }
@@ -1524,9 +1528,10 @@ EXPORT int iaxc_call_ex(const char *num, const char* callerid_name, const char* 
 	if ( video )
 		iaxc_video_format_get_cap(&video_format_preferred, &video_format_capability);
 #endif
-
+#ifdef VERBOSE
 	iaxci_usermsg(IAXC_NOTICE, "Originating an %s call",
 			video_format_preferred ? "audio+video" : "audio only");
+#endif
 	iax_call(calls[callNo].session, calls[callNo].callerid_number,
 			calls[callNo].callerid_name, num, NULL, 0,
 			audio_format_preferred | video_format_preferred,
