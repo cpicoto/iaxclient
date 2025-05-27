@@ -1342,11 +1342,15 @@ static void iaxc_handle_network_event(struct iax_event *e, int callNo)
         break;
     }
 	case IAXC_EVENT_RADIO_KEY:
+#ifdef VERBOSE	
 			iaxci_usermsg(IAXC_STATUS, "iaxc_handle_network_event:Radio key pressed");
+#endif
 			iaxci_do_radio_callback( 1);
 			break;
     case IAXC_EVENT_RADIO_UNKEY:
+#ifdef VERBOSE
 			iaxci_usermsg(IAXC_STATUS, "iaxc_handle_network_event:Radio key released");
+#endif
 			iaxci_do_radio_callback( 0);
 			break;
     case IAX_EVENT_LAGRQ:
