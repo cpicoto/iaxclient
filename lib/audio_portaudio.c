@@ -210,7 +210,7 @@ static int error_count;
 static int startup_counter;
 static int output_underruns;
 static HANDLE healthCheckThread;
-static int healthCheckThreadActive;
+static volatile LONG healthCheckThreadActive; // Use volatile LONG for atomic operations
 
 static struct iaxc_sound *sounds;
 static int  nextSoundId = 1;
@@ -229,6 +229,13 @@ static void pa_boost_buffer(void);
 #ifdef _WIN32
 static DWORD WINAPI HealthCheckTimerThread(LPVOID param);
 static void pa_setup_windows_audio_session(void);
+static CRITICAL_SECTION pa_stream_lock;
+static int pa_stream_lock_initialized = 0;
+
+// Compatibility function for InterlockedRead (not available on all Windows versions)
+static LONG InterlockedRead(volatile LONG* value) {
+    return InterlockedCompareExchange(value, 0, 0);
+}
 #endif
 
 /* scan devices and stash pointers to dev structures.
@@ -1409,6 +1416,15 @@ static int pa_start(struct iaxc_audio_driver *d)
 	static int errcnt = 0;
 	current_audio_format = paInt16;  // Fix for 0x0 format issue
 
+#ifdef _WIN32
+	// Initialize critical section if not already done
+	if (!pa_stream_lock_initialized) {
+		InitializeCriticalSection(&pa_stream_lock);
+		pa_stream_lock_initialized = 1;
+		PORT_LOG("pa_start: Initialized critical section for thread safety");
+	}
+#endif
+
 	if (running)
 		return 0;
 
@@ -1574,14 +1590,33 @@ static int pa_stop (struct iaxc_audio_driver *d)
 {
 	PaError err;
 
-	if (!running)
+#ifdef _WIN32
+	// Initialize critical section if not already done
+	if (!pa_stream_lock_initialized) {
+		InitializeCriticalSection(&pa_stream_lock);
+		pa_stream_lock_initialized = 1;
+	}
+	
+	// Enter critical section to prevent concurrent access
+	EnterCriticalSection(&pa_stream_lock);
+#endif
+
+	if (!running) {
+#ifdef _WIN32
+		LeaveCriticalSection(&pa_stream_lock);
+#endif
 		return 0;
+	}
 
 	// Keep the audio system running if sounds are being played
-	if (sounds)
+	if (sounds) {
+#ifdef _WIN32
+		LeaveCriticalSection(&pa_stream_lock);
+#endif
 		return 0;
+	}
 
-	PORT_LOG("pa_stop: Stopping PortAudio streams");
+	PORT_LOG("pa_stop: Stopping PortAudio streams (with thread protection)");
 
 	// Attempt error recovery if streams are in a bad state
 #ifdef _WIN32
@@ -1612,10 +1647,10 @@ static int pa_stop (struct iaxc_audio_driver *d)
 		err = Pa_AbortStream(iStream);
 		err = Pa_CloseStream(iStream);
 		iStream = NULL;
-	} else {
-		PORT_LOG("pa_stop: Input stream is NULL, skipping cleanup (non-Windows)");
+	} else {		PORT_LOG("pa_stop: Input stream is NULL, skipping cleanup (non-Windows)");
 	}
 #endif
+
 	if (!oneStream) {
 		// Handle output stream separately if using separate streams
 #ifdef _WIN32
@@ -1673,17 +1708,15 @@ static int pa_stop (struct iaxc_audio_driver *d)
 		speex_resampler = NULL;
 	}
 	
-	if (output_resampler) {		speex_resampler_destroy(output_resampler);
+	if (output_resampler) {
+		speex_resampler_destroy(output_resampler);
 		output_resampler = NULL;
 	}
 
 #ifdef _WIN32
-	// Stop health check thread 
-	if (healthCheckThreadActive) {
-		// Signal thread to exit
-		healthCheckThreadActive = 0;
-		
-		// Wait for thread to finish with timeout
+	// Stop health check thread using atomic operations
+	if (InterlockedCompareExchange(&healthCheckThreadActive, 0, 1) == 1) {
+		// Thread was active, wait for it to finish with timeout
 		if (healthCheckThread) {
 			WaitForSingleObject(healthCheckThread, 1000);
 			CloseHandle(healthCheckThread);
@@ -1693,8 +1726,14 @@ static int pa_stop (struct iaxc_audio_driver *d)
 	}
 #endif
 
-	PORT_LOG("pa_stop: Audio streams stopped");
+	PORT_LOG("pa_stop: Audio streams stopped (with thread protection)");
 	running = 0;
+
+#ifdef _WIN32
+	// Leave critical section
+	LeaveCriticalSection(&pa_stream_lock);
+#endif
+
 	return 0;
 }
 
@@ -2481,73 +2520,85 @@ static DWORD WINAPI HealthCheckTimerThread(LPVOID param)
         liDueTime.QuadPart = -3000000000LL; // Negative value = relative time (5 min in 100ns units)
         
         if (SetWaitableTimer(hTimer, &liDueTime, 0, NULL, NULL, FALSE)) {
-            healthCheckThreadActive = 1;
+            InterlockedExchange(&healthCheckThreadActive, 1);
             
-            PORT_LOG("HealthCheckTimerThread: Started with 5-minute initial interval");
+            PORT_LOG("HealthCheckTimerThread: Started with 5-minute initial interval (with thread protection)");
             
             // Track statistics for health monitoring
             int restart_count = 0;
             int last_restart_time = GetTickCount();
             
-            while (healthCheckThreadActive) {
+            while (InterlockedRead(&healthCheckThreadActive)) {
                 // Wait for the timer to trigger
                 DWORD result = WaitForSingleObject(hTimer, 10000); // Check every 10 seconds for thread exit
                 
-                if (!healthCheckThreadActive) {
+                if (!InterlockedRead(&healthCheckThreadActive)) {
                     break; // Exit thread if requested
                 }
                 
                 if (result == WAIT_OBJECT_0) {
-                    PORT_LOG("HealthCheckTimerThread: Performing scheduled audio health check");
+                    PORT_LOG("HealthCheckTimerThread: Performing scheduled audio health check (with protection)");
                     
                     // Check if currently running before performing health maintenance
-                    if (running) {
-                        // Do a thorough health check
-                        if (pa_check_stream_health(d)) {
-                            // Stream health check indicates problems that need a restart
-                            PORT_LOG("HealthCheckTimerThread: Health check detected issues, restarting audio");
-                            
-                            // Check if we're restarting too frequently (possible device issues)
-                            DWORD current_time = GetTickCount();
-                            if (current_time - last_restart_time < 60000 && restart_count > 2) {
-                                // Too many restarts in a short time, increase interval to prevent thrashing
-                                PORT_LOG("HealthCheckTimerThread: Too many restarts (%d) in short period, extending interval", 
-                                        restart_count);
+                    // Use critical section to safely check stream state
+                    if (pa_stream_lock_initialized) {
+                        EnterCriticalSection(&pa_stream_lock);
+                        int is_running = running;
+                        LeaveCriticalSection(&pa_stream_lock);
+                        
+                        if (is_running) {
+                            // Do a thorough health check
+                            if (pa_check_stream_health(d)) {
+                                // Stream health check indicates problems that need a restart
+                                PORT_LOG("HealthCheckTimerThread: Health check detected issues, restarting audio (protected)");
                                 
-                                // Show a warning to the user
-                                iaxci_usermsg(IAXC_TEXT_TYPE_NOTICE, 
-                                    "Audio system experiencing issues. Check your audio device settings.");
+                                // Check if we're restarting too frequently (possible device issues)
+                                DWORD current_time = GetTickCount();
+                                if (current_time - last_restart_time < 60000 && restart_count > 2) {
+                                    // Too many restarts in a short time, increase interval to prevent thrashing
+                                    PORT_LOG("HealthCheckTimerThread: Too many restarts (%d) in short period, extending interval", 
+                                            restart_count);
+                                    
+                                    // Show a warning to the user
+                                    iaxci_usermsg(IAXC_TEXT_TYPE_NOTICE, 
+                                        "Audio system experiencing issues. Check your audio device settings.");
+                                    
+                                    // Set next check farther away (30 minutes)
+                                    liDueTime.QuadPart = -18000000000LL;
+                                    restart_count = 0;
+                                } else {
+                                    // Set next check in 5 minutes
+                                    liDueTime.QuadPart = -3000000000LL;
+                                    restart_count++;
+                                }
                                 
-                                // Set next check farther away (30 minutes)
-                                liDueTime.QuadPart = -18000000000LL;
-                                restart_count = 0;
+                                // Perform the actual restart with proper synchronization
+                                // The pa_stop and pa_start functions now have their own critical sections
+                                pa_stop(d);
+                                iaxc_millisleep(500); // Give time for resources to be released
+                                pa_start(d);
+                                
+                                last_restart_time = GetTickCount();
+                                PORT_LOG("HealthCheckTimerThread: Audio streams restarted successfully (protected)");
                             } else {
-                                // Set next check in 5 minutes
-                                liDueTime.QuadPart = -3000000000LL;
-                                restart_count++;
+                                // No problems detected, perform routine maintenance
+                                PORT_LOG("HealthCheckTimerThread: No issues detected, performing routine maintenance");
+                                
+                                // Reset counters for good behavior
+                                error_count = 0;
+                                
+                                // Set next check in 15 minutes (longer interval for healthy systems)
+                                liDueTime.QuadPart = -9000000000LL;
+                                restart_count = 0;
                             }
-                            
-                            // Perform the actual restart
-                            pa_stop(d);
-                            iaxc_millisleep(500); // Give time for resources to be released
-                            pa_start(d);
-                            
-                            last_restart_time = GetTickCount();
-                            PORT_LOG("HealthCheckTimerThread: Audio streams restarted successfully");
                         } else {
-                            // No problems detected, perform routine maintenance
-                            PORT_LOG("HealthCheckTimerThread: No issues detected, performing routine maintenance");
-                            
-                            // Reset counters for good behavior
-                            error_count = 0;
-                            
-                            // Set next check in 15 minutes (longer interval for healthy systems)
-                            liDueTime.QuadPart = -9000000000LL;
-                            restart_count = 0;
+                            // Audio not running, just reset the timer
+                            PORT_LOG("HealthCheckTimerThread: Audio not running, skipping health check");
+                            liDueTime.QuadPart = -3000000000LL;
                         }
                     } else {
-                        // Audio not running, just reset the timer
-                        PORT_LOG("HealthCheckTimerThread: Audio not running, skipping health check");
+                        // Critical section not initialized, skip this check
+                        PORT_LOG("HealthCheckTimerThread: Critical section not initialized, skipping health check");
                         liDueTime.QuadPart = -3000000000LL;
                     }
                     
@@ -2559,7 +2610,7 @@ static DWORD WINAPI HealthCheckTimerThread(LPVOID param)
         CloseHandle(hTimer);
     }
     
-    PORT_LOG("HealthCheckTimerThread: Thread terminated");
+    PORT_LOG("HealthCheckTimerThread: Thread terminated (protected)");
     return 0;
 }
 #endif
