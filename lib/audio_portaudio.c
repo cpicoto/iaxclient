@@ -263,25 +263,32 @@ static int scan_devices(struct iaxc_audio_driver *d)
 
 			if ( pa->maxInputChannels > 0 ){
 				dev->capabilities |= IAXC_AD_INPUT;
+#ifdef VERBOSE                
 				PORT_LOG("scan_devices:IAXC_AD_INPUT: %s", dev->name);
+#endif                
 			}
 
 			if ( pa->maxOutputChannels > 0 )
 			{
 				dev->capabilities |= IAXC_AD_OUTPUT;
 				dev->capabilities |= IAXC_AD_RING;
+#ifdef VERBOSE                                
 				PORT_LOG("scan_devices:IAXC_AD_OUTPUT: %s", dev->name);
+#endif                
 			}
 
-			if ( i == Pa_GetDefaultInputDevice() ){
-				dev->capabilities |= IAXC_AD_INPUT_DEFAULT;
+			if ( i == Pa_GetDefaultInputDevice() ){	
+#ifdef VERBOSE                                
 				PORT_LOG("scan_devices:IAXC_AD_INPUT_DEFAULT: %s", dev->name);
+#endif                
 			}
 			if ( i == Pa_GetDefaultOutputDevice() )
 			{
 				dev->capabilities |= IAXC_AD_OUTPUT_DEFAULT;
 				dev->capabilities |= IAXC_AD_RING_DEFAULT;
+#ifdef VERBOSE                                
 				PORT_LOG("scan_devices:IAXC_AD_OUTPUT_DEFAULT: %s", dev->name);
+#endif
 			}
 		}
 		else //frik: under Terminal Services
@@ -687,10 +694,12 @@ static int pa_callback(
         }
         
         int written = PaUtil_WriteRingBuffer(&inRing, resampled_buffer, out_len);
+#ifdef VERBOSE        
         if (debug_counter % 500 == 0) {
             PORT_LOG("pa_callback: Resampled %lu frames to %lu frames (%d written to buffer)",
                     hostFrames, (unsigned long)out_len, written);
         }
+#endif        
     } else {
         // If no resampling needed or no resampler available, use direct copy
         int ring_space = PaUtil_GetRingBufferWriteAvailable(&inRing);
@@ -773,8 +782,10 @@ static int pa_callback(
                 // No samples available
                 output_underruns++;
                 if (output_underruns % 100 == 0) {
+#ifdef VERBOSE                    
                     PORT_LOG("pa_callback: OUTPUT UNDERRUN (%d): No data available for audio output", 
                             output_underruns);
+#endif
                 }
                 memset(outBuf, 0, hostFrames * sizeof(SAMPLE));
             }
@@ -818,11 +829,12 @@ static int pa_callback(
             
             // Actual recovery is performed in pa_input/pa_output calls
         }
-        
+#ifdef VERBOSE        
         // Log performance stats periodically
         PORT_LOG("pa_callback: HEALTH CHECK - %lld frames processed, %d underruns, %d overflows",
                 (long long)total_frames_processed, output_underruns, 
                 PaUtil_GetRingBufferFullCount(&inRing));
+#endif
     }
     
     return paContinue;
@@ -1693,7 +1705,9 @@ static int pa_check_stream_health(struct iaxc_audio_driver *d)
     
     // Check if we have too many errors
     if (error_count > 15) {
+#ifdef VERBOSE        
         PORT_LOG("pa_check_stream_health: Too many errors (%d), requesting restart", error_count);
+#endif
         return 1; // Need restart
     }
     
@@ -1706,8 +1720,10 @@ static int pa_check_stream_health(struct iaxc_audio_driver *d)
     }
     
     if (output_underruns > underrun_threshold) {
+#ifdef VERBOSE        
         PORT_LOG("pa_check_stream_health: Too many underruns (%d > %d), requesting restart", 
                 output_underruns, underrun_threshold);
+#endif
         return 1; // Need restart
     }
       // Proactively boost buffer only when we see signs of trouble (more responsive)
@@ -1790,7 +1806,10 @@ static int pa_input(struct iaxc_audio_driver *d, void *samples, int *nSamples)
     // Periodically check audio stream health (every 5 seconds)
     if (current_time - last_health_check >= 5) {
         if (pa_check_stream_health(d)) {
+#ifdef VERBOSE            
             PORT_LOG("pa_input: Stream health check detected and recovered from a problem");
+#endif
+            // If we had a problem, reset the error count and last success time            
             // After recovery, reset some stats
             error_count = 0;
             last_success_time = current_time;
@@ -1803,10 +1822,12 @@ static int pa_input(struct iaxc_audio_driver *d, void *samples, int *nSamples)
     
     // Log stats periodically to help with debugging
     if (current_time - last_stats_time >= 30) {  // Every 30 seconds
+#ifdef VERBOSE        
         PORT_LOG("pa_input: STATS: %d calls in %d seconds, %d total samples read (%.1f samples/call)",
                 call_count, current_time - last_stats_time, 
                 total_samples_read, 
                 (float)total_samples_read / (call_count > 0 ? call_count : 1));
+#endif
         call_count = 0;
         total_samples_read = 0;
         last_stats_time = current_time;
@@ -1880,8 +1901,10 @@ static int pa_input(struct iaxc_audio_driver *d, void *samples, int *nSamples)
             consecutive_silent++;
             
             if (consecutive_silent % 50 == 0) {  // Log after ~5 seconds of silence
+#ifdef VERBOSE
                 PORT_LOG("pa_input: WARNING: Detected %d consecutive silent inputs - check microphone",
                         consecutive_silent);
+#endif
             }
         } else {
             // Reset the counter when we get non-silent audio
@@ -1973,10 +1996,10 @@ static int pa_output(struct iaxc_audio_driver *d, void *samples, int nSamples)
     // Report buffer metrics periodically
     if (current_time - last_report_time >= 10) {  // Every 10 seconds
         float buffer_fullness = (float)(OUTRBSZ - outRingLen) / OUTRBSZ * 100.0f;
-        
+#ifdef VERBOSE        
         PORT_LOG("pa_output: Buffer stats - %d%% full, %d samples/sec avg",
                 (int)buffer_fullness, total_samples / (current_time - last_report_time));
-        
+#endif        
         last_report_time = current_time;
         total_samples = 0;
     }
