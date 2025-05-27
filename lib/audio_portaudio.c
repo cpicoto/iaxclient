@@ -1563,20 +1563,8 @@ static int pa_start(struct iaxc_audio_driver *d)
 	}
 
 #ifdef _WIN32
-	// Start health check thread for Windows to monitor audio stream health
-	if (!healthCheckThreadActive) {
-		healthCheckThreadActive = 0;
-		healthCheckThread = CreateThread(NULL, 0, 
-			&HealthCheckTimerThread, 
-			NULL, 0, NULL);
-		
-		if (healthCheckThread) {
-			SetThreadPriority(healthCheckThread, THREAD_PRIORITY_ABOVE_NORMAL);
-			PORT_LOG("pa_start: Started health check thread for audio stability");
-		} else {
-			PORT_LOG("pa_start: Failed to start health check thread: %d", GetLastError());
-		}
-	}
+	// Health check is now managed by the timer-based system in pa_initialize
+	// No need to create additional threads here to avoid duplication
 #endif
 
 	PORT_LOG("pa_start: Audio streams started successfully");
@@ -1641,13 +1629,13 @@ static int pa_stop (struct iaxc_audio_driver *d)
 	} else {
 		PORT_LOG("pa_stop: Input stream is NULL, skipping cleanup");
 	}
-#else
-	// For non-Windows, use the standard approach
+#else	// For non-Windows, use the standard approach
 	if (iStream != NULL) {
 		err = Pa_AbortStream(iStream);
 		err = Pa_CloseStream(iStream);
 		iStream = NULL;
-	} else {		PORT_LOG("pa_stop: Input stream is NULL, skipping cleanup (non-Windows)");
+	} else {
+		PORT_LOG("pa_stop: Input stream is NULL, skipping cleanup (non-Windows)");
 	}
 #endif
 
@@ -1739,20 +1727,19 @@ static int pa_stop (struct iaxc_audio_driver *d)
 
 // Modify the pa_check_stream_health function to use our buffer booster
 static int pa_check_stream_health(struct iaxc_audio_driver *d)
-{
-    // This function is called periodically to check the health of audio streams
+{    // This function is called periodically to check the health of audio streams
     
-    // Check if we have too many errors
-    if (error_count > 15) {
+    // Much more conservative error threshold to avoid false positives
+    if (error_count > 50) {  // Increased from 15 to 50
 #ifdef VERBOSE        
         PORT_LOG("pa_check_stream_health: Too many errors (%d), requesting restart", error_count);
 #endif
         return 1; // Need restart
     }
     
-    // Adaptive underrun threshold - be more tolerant during startup but responsive during operation
-    static int startup_grace_period = 100; // Allow more underruns during initial startup
-    int underrun_threshold = (startup_grace_period > 0) ? 150 : 75;
+    // Much more tolerant underrun thresholds - PTT operation can cause temporary underruns
+    static int startup_grace_period = 200; // Longer grace period
+    int underrun_threshold = (startup_grace_period > 0) ? 300 : 200; // Much higher thresholds
     
     if (startup_grace_period > 0) {
         startup_grace_period--;
@@ -1764,9 +1751,8 @@ static int pa_check_stream_health(struct iaxc_audio_driver *d)
                 output_underruns, underrun_threshold);
 #endif
         return 1; // Need restart
-    }
-      // Proactively boost buffer only when we see signs of trouble (more responsive)
-    if (output_underruns > 10) {  // Increased threshold to be less aggressive
+    }      // Be much more conservative about buffer boosting - only when really needed
+    if (output_underruns > 50) {  // Much higher threshold to avoid interference with PTT
         pa_boost_buffer();
     }
     
@@ -2348,14 +2334,13 @@ int pa_initialize(struct iaxc_audio_driver *d, int sr)
 #ifdef _WIN32
     static HANDLE healthCheckTimer = NULL;
     static BOOL timerInitialized = FALSE;
-    
-    if (!timerInitialized) {
-        // Create a timer that will force a stream restart every hour
-        // This helps with long-term stability, especially on systems that run for days
+      if (!timerInitialized) {
+        // Create a timer for periodic health checks - less frequent to avoid interfering with normal operation
         HANDLE hTimer = CreateWaitableTimer(NULL, TRUE, "IAXAudioHealthTimer");
         if (hTimer) {
             LARGE_INTEGER liDueTime;
-            liDueTime.QuadPart = -36000000000LL; // Negative value = relative time (1 hour in 100ns units)
+            // Start with 10 minutes instead of 1 hour for initial check, then extend if healthy
+            liDueTime.QuadPart = -6000000000LL; // 10 minutes in 100ns units
             
             if (SetWaitableTimer(hTimer, &liDueTime, 0, NULL, NULL, FALSE)) {
                 // Create a thread to wait for the timer
@@ -2364,7 +2349,7 @@ int pa_initialize(struct iaxc_audio_driver *d, int sr)
                     d, 0, NULL);
                 
                 if (hThread) {
-                    PORT_LOG("pa_initialize: Scheduled automatic health check for long-term stability");
+                    PORT_LOG("pa_initialize: Scheduled health check every 10 minutes for stability monitoring");
                     CloseHandle(hThread);
                     timerInitialized = TRUE;
                     healthCheckTimer = hTimer;
@@ -2512,32 +2497,31 @@ static void pa_setup_windows_audio_session(void)
 // Health check timer thread function
 static DWORD WINAPI HealthCheckTimerThread(LPVOID param)
 {
-    struct iaxc_audio_driver *d = (struct iaxc_audio_driver *)param;
-    HANDLE hTimer = CreateWaitableTimer(NULL, TRUE, "IAXAudioHealthTimer");
+    struct iaxc_audio_driver *d = (struct iaxc_audio_driver *)param;    HANDLE hTimer = CreateWaitableTimer(NULL, TRUE, "IAXAudioHealthTimer");
     if (hTimer) {
         LARGE_INTEGER liDueTime;
-        // Initial check after 5 minutes
-        liDueTime.QuadPart = -3000000000LL; // Negative value = relative time (5 min in 100ns units)
+        // Initial check after 10 minutes - less frequent to avoid interfering with normal operation
+        liDueTime.QuadPart = -6000000000LL; // 10 minutes in 100ns units
         
         if (SetWaitableTimer(hTimer, &liDueTime, 0, NULL, NULL, FALSE)) {
             InterlockedExchange(&healthCheckThreadActive, 1);
             
-            PORT_LOG("HealthCheckTimerThread: Started with 5-minute initial interval (with thread protection)");
+            PORT_LOG("HealthCheckTimerThread: Started with 10-minute initial interval for stability monitoring");
             
             // Track statistics for health monitoring
             int restart_count = 0;
             int last_restart_time = GetTickCount();
             
             while (InterlockedRead(&healthCheckThreadActive)) {
-                // Wait for the timer to trigger
-                DWORD result = WaitForSingleObject(hTimer, 10000); // Check every 10 seconds for thread exit
+                // Wait for the timer to trigger - longer timeout to reduce CPU usage
+                DWORD result = WaitForSingleObject(hTimer, 30000); // Check every 30 seconds for thread exit
                 
                 if (!InterlockedRead(&healthCheckThreadActive)) {
                     break; // Exit thread if requested
                 }
                 
                 if (result == WAIT_OBJECT_0) {
-                    PORT_LOG("HealthCheckTimerThread: Performing scheduled audio health check (with protection)");
+                    PORT_LOG("HealthCheckTimerThread: Performing periodic health check");
                     
                     // Check if currently running before performing health maintenance
                     // Use critical section to safely check stream state
@@ -2553,8 +2537,7 @@ static DWORD WINAPI HealthCheckTimerThread(LPVOID param)
                                 PORT_LOG("HealthCheckTimerThread: Health check detected issues, restarting audio (protected)");
                                 
                                 // Check if we're restarting too frequently (possible device issues)
-                                DWORD current_time = GetTickCount();
-                                if (current_time - last_restart_time < 60000 && restart_count > 2) {
+                                DWORD current_time = GetTickCount();                                if (current_time - last_restart_time < 300000 && restart_count > 1) { // 5 minutes instead of 1 minute
                                     // Too many restarts in a short time, increase interval to prevent thrashing
                                     PORT_LOG("HealthCheckTimerThread: Too many restarts (%d) in short period, extending interval", 
                                             restart_count);
@@ -2563,12 +2546,12 @@ static DWORD WINAPI HealthCheckTimerThread(LPVOID param)
                                     iaxci_usermsg(IAXC_TEXT_TYPE_NOTICE, 
                                         "Audio system experiencing issues. Check your audio device settings.");
                                     
-                                    // Set next check farther away (30 minutes)
-                                    liDueTime.QuadPart = -18000000000LL;
+                                    // Set next check farther away (2 hours)
+                                    liDueTime.QuadPart = -72000000000LL; // 2 hours
                                     restart_count = 0;
                                 } else {
-                                    // Set next check in 5 minutes
-                                    liDueTime.QuadPart = -3000000000LL;
+                                    // Set next check in 30 minutes instead of 5
+                                    liDueTime.QuadPart = -18000000000LL; // 30 minutes
                                     restart_count++;
                                 }
                                 
@@ -2579,28 +2562,27 @@ static DWORD WINAPI HealthCheckTimerThread(LPVOID param)
                                 pa_start(d);
                                 
                                 last_restart_time = GetTickCount();
-                                PORT_LOG("HealthCheckTimerThread: Audio streams restarted successfully (protected)");
+                                PORT_LOG("HealthCheckTimerThread: Audio streams restarted successfully");
                             } else {
                                 // No problems detected, perform routine maintenance
-                                PORT_LOG("HealthCheckTimerThread: No issues detected, performing routine maintenance");
+                                PORT_LOG("HealthCheckTimerThread: System healthy, extending check interval");
                                 
                                 // Reset counters for good behavior
                                 error_count = 0;
                                 
-                                // Set next check in 15 minutes (longer interval for healthy systems)
-                                liDueTime.QuadPart = -9000000000LL;
+                                // Set next check in 1 hour for healthy systems
+                                liDueTime.QuadPart = -36000000000LL; // 1 hour
                                 restart_count = 0;
                             }
                         } else {
                             // Audio not running, just reset the timer
                             PORT_LOG("HealthCheckTimerThread: Audio not running, skipping health check");
-                            liDueTime.QuadPart = -3000000000LL;
+                            liDueTime.QuadPart = -18000000000LL; // 30 minutes
+                        }                        } else {
+                            // Critical section not initialized, skip this check
+                            PORT_LOG("HealthCheckTimerThread: Critical section not initialized, skipping health check");
+                            liDueTime.QuadPart = -18000000000LL; // 30 minutes
                         }
-                    } else {
-                        // Critical section not initialized, skip this check
-                        PORT_LOG("HealthCheckTimerThread: Critical section not initialized, skipping health check");
-                        liDueTime.QuadPart = -3000000000LL;
-                    }
                     
                     // Set the timer for the next check
                     SetWaitableTimer(hTimer, &liDueTime, 0, NULL, NULL, FALSE);
