@@ -1400,6 +1400,7 @@ static int pa_start(struct iaxc_audio_driver *d)
 	if (running)
 		return 0;
 
+	PORT_LOG("iaxclient PortAudio module built on %s at %s", __DATE__, __TIME__);
 	PORT_LOG("pa_start: Setting up audio with format 0x%x (paInt16)", current_audio_format);
 
 	// Add format check and fix
@@ -1572,51 +1573,66 @@ static int pa_stop (struct iaxc_audio_driver *d)
 
 	// Attempt error recovery if streams are in a bad state
 #ifdef _WIN32
-	PaError inputStatus = Pa_IsStreamActive(iStream);
-	if (inputStatus == 1) {
-		// Normal active stream - proceed with abort
-		err = Pa_AbortStream(iStream);
-		if (err != paNoError) {
-			PORT_LOG("pa_stop: Error aborting input stream: %s", Pa_GetErrorText(err));
+	// First check if iStream is valid before using it
+	if (iStream != NULL) {
+		PaError inputStatus = Pa_IsStreamActive(iStream);
+		if (inputStatus == 1) {
+			// Normal active stream - proceed with abort
+			err = Pa_AbortStream(iStream);
+			if (err != paNoError) {
+				PORT_LOG("pa_stop: Error aborting input stream: %s", Pa_GetErrorText(err));
+			}
+		} else if (inputStatus < 0) {
+			// Stream in error state - try to recover
+			PORT_LOG("pa_stop: Input stream in error state (%d), attempting recovery", inputStatus);
+			Pa_CloseStream(iStream);
+			iStream = NULL;
+		} else {
+			// Stream already stopped
+			err = Pa_CloseStream(iStream);
 		}
-	} else if (inputStatus < 0) {
-		// Stream in error state - try to recover
-		PORT_LOG("pa_stop: Input stream in error state (%d), attempting recovery", inputStatus);
-		Pa_CloseStream(iStream);
-		iStream = NULL;
 	} else {
-		// Stream already stopped
-		err = Pa_CloseStream(iStream);
+		PORT_LOG("pa_stop: Input stream is NULL, skipping cleanup");
 	}
 #else
 	// For non-Windows, use the standard approach
-	err = Pa_AbortStream(iStream);
-	err = Pa_CloseStream(iStream);
+	if (iStream != NULL) {
+		err = Pa_AbortStream(iStream);
+		err = Pa_CloseStream(iStream);
+		iStream = NULL;
+	} else {
+		PORT_LOG("pa_stop: Input stream is NULL, skipping cleanup (non-Windows)");
+	}
 #endif
-
 	if (!oneStream) {
 		// Handle output stream separately if using separate streams
 #ifdef _WIN32
-		PaError outputStatus = Pa_IsStreamActive(oStream);
-		if (outputStatus == 1) {
-			err = Pa_AbortStream(oStream);
-			if (err != paNoError) {
-				PORT_LOG("pa_stop: Error aborting output stream: %s", Pa_GetErrorText(err));
+		if (oStream != NULL) {
+			PaError outputStatus = Pa_IsStreamActive(oStream);
+			if (outputStatus == 1) {
+				err = Pa_AbortStream(oStream);
+				if (err != paNoError) {
+					PORT_LOG("pa_stop: Error aborting output stream: %s", Pa_GetErrorText(err));
+				}
+			} else if (outputStatus < 0) {
+				PORT_LOG("pa_stop: Output stream in error state (%d), attempting recovery", outputStatus);
+				Pa_CloseStream(oStream);
+				oStream = NULL;
+			} else {
+				err = Pa_CloseStream(oStream);
 			}
-		} else if (outputStatus < 0) {
-			PORT_LOG("pa_stop: Output stream in error state (%d), attempting recovery", outputStatus);
-			Pa_CloseStream(oStream);
-			oStream = NULL;
 		} else {
-			err = Pa_CloseStream(oStream);
+			PORT_LOG("pa_stop: Output stream is NULL, skipping cleanup");
 		}
 #else
-		err = Pa_AbortStream(oStream);
-		err = Pa_CloseStream(oStream);
+		if (oStream != NULL) {
+			err = Pa_AbortStream(oStream);
+			err = Pa_CloseStream(oStream);
+		}
 #endif
 	}
 
-	if (auxStream) {
+	if (auxStream && aStream != NULL) {
 #ifdef _WIN32
 		PaError auxStatus = Pa_IsStreamActive(aStream);
 		if (auxStatus == 1) {
@@ -1635,6 +1651,8 @@ static int pa_stop (struct iaxc_audio_driver *d)
 		err = Pa_AbortStream(aStream);
 		err = Pa_CloseStream(aStream);
 #endif
+	} else if (auxStream) {
+		PORT_LOG("pa_stop: Auxiliary stream variable is true but aStream pointer is NULL");
 	}
 
 	// Clean up resamplers to avoid memory leaks

@@ -599,6 +599,7 @@ EXPORT int iaxc_initialize(int num_calls)
 #ifdef VERBOSE
 	IAX_LOG("iaxc_initialize:Starting");
 #endif
+    IAX_LOG("iaxclient library built on %s at %s", __DATE__, __TIME__);
 
 #ifdef VERBOSE
 	printf("VERBOSE is defined\n");
