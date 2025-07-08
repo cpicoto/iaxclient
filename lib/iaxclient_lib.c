@@ -90,6 +90,9 @@
 /* global test mode flag */
 int test_mode = 0;
 
+/* Function prototypes for internal functions */
+static struct iaxc_registration *find_registration_by_hostname(const char *hostname);
+
 /* configurable jitterbuffer options */
 static long jb_target_extra = -1;
 
@@ -97,7 +100,8 @@ struct iaxc_registration
 {
 	struct iax_session *session;
 	struct timeval last;
-	char host[256];
+	char host[256];     /* Stores the parsed hostname (without port) */
+	char full_host[256]; /* Stores the full hostname:port string */
 	char user[256];
 	char pass[256];
 	long refresh;
@@ -789,6 +793,8 @@ static void iaxc_refresh_registrations()
 				iaxci_usermsg(IAXC_ERROR, "Can't make new registration session");
 				return;
 			}
+			// Use the host field which now contains the full host:port string
+			IAX_LOG("iaxc_refresh_registrations: Refreshing registration with host='%s'", cur->host);
 			iax_register(cur->session, cur->host, cur->user, cur->pass, cur->refresh);
 			cur->last = now;
 		}
@@ -1391,6 +1397,25 @@ EXPORT int iaxc_register(const char * user, const char * pass, const char * host
 EXPORT int iaxc_register_ex(const char * user, const char * pass, const char * host, int refresh)
 {
 	struct iaxc_registration *newreg;
+	char hostname[256];
+	char *port_str;
+
+	// Parse host:port format for logging only, but keep the original string intact
+	strncpy(hostname, host, sizeof(hostname)-1);
+	hostname[sizeof(hostname)-1] = '\0';
+	
+	char temp_hostname[256];
+	strncpy(temp_hostname, hostname, sizeof(temp_hostname)-1);
+	temp_hostname[sizeof(temp_hostname)-1] = '\0';
+	
+	port_str = strchr(temp_hostname, ':');
+	if (port_str) {
+		*port_str = '\0';  // Terminate temp hostname
+		int dest_port = atoi(port_str + 1);  // Extract port for logging
+		IAX_LOG("iaxc_register_ex: Parsed destination hostname='%s' port=%d from '%s'", temp_hostname, dest_port, host);
+	} else {
+		IAX_LOG("iaxc_register_ex: No port specified in '%s', using hostname as-is", host);
+	}
 
 	newreg = (struct iaxc_registration *)malloc(sizeof (struct iaxc_registration));
 	if ( !newreg )
@@ -1411,11 +1436,14 @@ EXPORT int iaxc_register_ex(const char * user, const char * pass, const char * h
 	newreg->last = iax_tvnow();
 	newreg->refresh = refresh;
 
-	strncpy(newreg->host, host, 256);
+	// Store the original host:port string in both fields for consistency
+	strncpy(newreg->host, host, 256);  // Store full host:port string
+	strncpy(newreg->full_host, host, 256); // Original host:port string (redundant but for safety)
 	strncpy(newreg->user, user, 256);
 	strncpy(newreg->pass, pass, 256);
 
-	/* send out the initial registration with refresh seconds */
+	/* send out the initial registration with original host:port string */
+	IAX_LOG("iaxc_register_ex: Calling iax_register with full host:port='%s'", host);
 	iax_register(newreg->session, host, user, pass, refresh);
 
 	/* add it to the list; */
@@ -1532,6 +1560,80 @@ EXPORT int iaxc_call_ex(const char *num, const char* callerid_name, const char* 
 	iaxci_usermsg(IAXC_NOTICE, "Originating an %s call",
 			video_format_preferred ? "audio+video" : "audio only");
 #endif
+
+    // Check if we have a registration for this hostname and need to preserve port
+    if (strchr(num, '@')) {
+        char call_dest[256];
+        char *hostname_part;
+        struct iaxc_registration *reg;
+        
+        IAX_LOG("iaxc_call: Analyzing call destination '%s'", num);
+        
+        // Make a copy to parse
+        strncpy(call_dest, num, sizeof(call_dest)-1);
+        call_dest[sizeof(call_dest)-1] = '\0';
+        
+        // Find hostname part after @
+        hostname_part = strchr(call_dest, '@');
+        if (hostname_part) {
+            hostname_part++; // Move past @
+            
+            // Find end of hostname (/ or end of string)
+            char *end = strchr(hostname_part, '/');
+            if (end) {
+                IAX_LOG("iaxc_call: Found slash in hostname part: '%s'", hostname_part);
+                *end = '\0'; // Temporarily terminate hostname
+            }
+            
+            IAX_LOG("iaxc_call: Looking for registration for hostname '%s'", hostname_part);
+            // Check if we have a registration for this host
+            reg = find_registration_by_hostname(hostname_part);
+            
+            if (reg && strchr(reg->host, ':')) {
+                // Construct new call destination with port from registration
+                static char new_dest[512]; // Static to ensure it persists after function returns
+                char *slash_part = NULL;
+                char username_part[256] = "";
+                
+                // Extract username part (before @)
+                char *at_pos = strchr(call_dest, '@');
+                if (at_pos) {
+                    strncpy(username_part, call_dest, at_pos - call_dest);
+                    username_part[at_pos - call_dest] = '\0';
+                }
+                
+                if (end) {
+                    slash_part = end + 1; // Remember the part after / if any
+                    *end = '\0'; // Terminate at the slash
+                }
+                
+                IAX_LOG("iaxc_call: Found registration with port for %s, using %s", hostname_part, reg->host);
+                
+                if (slash_part) {
+                    // Format: user@hostname:port/extension
+                    // Make sure we don't double up on slashes
+                    if (*slash_part == '/') {
+                        // Skip leading slash in slash_part to avoid double slash
+                        snprintf(new_dest, sizeof(new_dest), "%s@%s/%s", 
+                                username_part, reg->host, slash_part + 1);
+                    } else {
+                        snprintf(new_dest, sizeof(new_dest), "%s@%s/%s", 
+                                username_part, reg->host, slash_part);
+                    }
+                } else {
+                    // Format: user@hostname:port
+                    snprintf(new_dest, sizeof(new_dest), "%s@%s", 
+                            username_part, reg->host);
+                }
+                
+                IAX_LOG("iaxc_call: Modified call destination: %s -> %s", num, new_dest);
+                num = new_dest;
+            } else if (end) {
+                *end = '/'; // Restore the / if we modified it
+            }
+        }
+    }
+    
 	iax_call(calls[callNo].session, calls[callNo].callerid_number,
 			calls[callNo].callerid_name, num, NULL, 0,
 			audio_format_preferred | video_format_preferred,
@@ -1707,6 +1809,52 @@ static struct iaxc_registration *iaxc_find_registration_by_session(
 	return reg;
 }
 
+
+// Function to find registration information by hostname (with or without port)
+static struct iaxc_registration *find_registration_by_hostname(const char *hostname) {
+    struct iaxc_registration *reg;
+    char temp_host[256];
+    char *port_str;
+    int host_len;
+    
+    IAX_LOG("find_registration_by_hostname: Looking for registration with hostname '%s'", hostname);
+    
+    // Make a copy of the hostname to parse
+    strncpy(temp_host, hostname, sizeof(temp_host)-1);
+    temp_host[sizeof(temp_host)-1] = '\0';
+    
+    // Remove port if present for matching purposes
+    port_str = strchr(temp_host, ':');
+    if (port_str) {
+        *port_str = '\0';
+    }
+    
+    host_len = strlen(temp_host);
+    
+    // Find matching registration
+    for (reg = registrations; reg != NULL; reg = reg->next) {
+        char reg_host[256];
+        char *reg_port_str;
+        
+        // Make a copy of registration host to parse
+        strncpy(reg_host, reg->host, sizeof(reg_host)-1);
+        reg_host[sizeof(reg_host)-1] = '\0';
+        
+        // Remove port if present
+        reg_port_str = strchr(reg_host, ':');
+        if (reg_port_str) {
+            *reg_port_str = '\0';
+        }
+        
+        // Compare hostnames
+        if (strncmp(temp_host, reg_host, host_len) == 0) {
+            IAX_LOG("find_registration_by_hostname: Found matching registration with host='%s'", reg->host);
+            return reg;
+        }
+    }
+    
+    return NULL;
+}
 
 static void iaxc_handle_regreply(struct iax_event *e, struct iaxc_registration *reg)
 {

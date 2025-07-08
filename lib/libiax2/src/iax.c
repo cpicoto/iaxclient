@@ -220,6 +220,8 @@ struct iax_session {
 	unsigned int pingtime;
 	/* Address of peer */
 	struct sockaddr_in peeraddr;
+	/* Explicit port to use for peer (for consistent port usage) */
+	int peerport;
 	/* Our call number */
 	int callno;
 	/* Peer's call number */
@@ -415,7 +417,10 @@ unsigned int iax_session_get_capability(struct iax_session *s)
 
 static int inaddrcmp(struct sockaddr_in *sin1, struct sockaddr_in *sin2)
 {
-	return (sin1->sin_addr.s_addr != sin2->sin_addr.s_addr) || (sin1->sin_port != sin2->sin_port);
+	// Only compare IP addresses, ignore ports for now
+	// This allows the code to work even when receiving packets from different source ports
+	// We'll handle port matching more precisely elsewhere
+	return (sin1->sin_addr.s_addr != sin2->sin_addr.s_addr);
 }
 
 static int iax_sched_add(struct iax_event *event, struct iax_frame *frame, sched_func func, void *arg, int ms)
@@ -533,6 +538,7 @@ struct iax_session *iax_session_new(void)
 		if (callnums > 32767)
 			callnums = 1;
 		s->peercallno = 0;
+		s->peerport = 0;  /* Initialize peerport to 0 (will use default) */
 		s->lastvnak = -1;
 		s->transferpeer = 0; /* for attended transfer */
 		s->next = sessions;
@@ -914,11 +920,29 @@ static int iax_xmit_frame(struct iax_frame *f)
     }
 
 	/* Send the frame raw */
+	struct sockaddr_in send_addr;
+	
+	if (f->transfer) {
+		/* Use transfer address */
+		memcpy(&send_addr, &(f->session->transfer), sizeof(send_addr));
+	} else {
+		/* Use peer address, but ensure correct port if we have a specific peer port */
+		memcpy(&send_addr, &(f->session->peeraddr), sizeof(send_addr));
+		if (f->session->peerport > 0) {
+			/* Log before changing port to see what's happening */
+			IAX_LOG("iax_send_raw: Using explicit peer port %d instead of %d", 
+				f->session->peerport, ntohs(send_addr.sin_port));
+			send_addr.sin_port = htons((short)f->session->peerport);
+		}
+	}
+	
+	/* Log final destination for debugging */
+	IAX_LOG("iax_send_raw: Sending to %s:%d", 
+		inet_ntoa(send_addr.sin_addr), ntohs(send_addr.sin_port));
+		
 	res = f->session->sendto(netfd, (const char *) f->data, f->datalen,
-			IAX_SOCKOPTS, f->transfer ?
-			(struct sockaddr *)&(f->session->transfer) :
-			(struct sockaddr *)&(f->session->peeraddr),
-			sizeof(f->session->peeraddr));
+			IAX_SOCKOPTS, (struct sockaddr *)&send_addr,
+			sizeof(send_addr));
 	return res;
 }
 
@@ -1847,6 +1871,19 @@ int iax_register(struct iax_session *session, const char *server, const char *pe
     memcpy(&session->peeraddr.sin_addr, &sa.sin_addr, sizeof(session->peeraddr.sin_addr));
     session->peeraddr.sin_port = htons(portno);
     session->peeraddr.sin_family = AF_INET;
+    
+    /* Add debug log for network connection details */
+    IAX_LOG("iax_register: Connecting to %s:%d (original server='%s')", 
+        inet_ntoa(session->peeraddr.sin_addr), portno, server);
+    
+    /* Store the port number explicitly for all future communication */
+    session->peerport = portno;
+    
+    /* Make sure the socket address has the same port */
+    session->peeraddr.sin_port = htons(portno);
+    
+    IAX_LOG("iax_register: Set explicit peer port to %d for all future communications", portno);
+    
     strncpy(session->username, peer, sizeof(session->username) - 1);
     session->refresh = refresh;
     iax_ie_append_str(&ied, IAX_IE_USERNAME, peer);
@@ -2290,6 +2327,19 @@ int iax_call(struct iax_session *session, const char *cidnum, const char *cidnam
 	memcpy(&session->peeraddr.sin_addr, hp->h_addr, sizeof(session->peeraddr.sin_addr));
 	session->peeraddr.sin_port = htons(portno);
 	session->peeraddr.sin_family = AF_INET;
+	
+	/* Add debug log for network connection details */
+	IAX_LOG("iax_call: Connecting to %s:%d (%s)", 
+		inet_ntoa(session->peeraddr.sin_addr), portno, hostname);
+		
+	/* Store the port number explicitly for all future communication */
+	session->peerport = portno;
+	
+	/* Make sure the socket address has the same port */
+	session->peeraddr.sin_port = htons(portno);
+	
+	IAX_LOG("iax_call: Set explicit peer port to %d for all future communications", portno);
+	
 	res = send_command(session, AST_FRAME_IAX, IAX_COMMAND_NEW, 0, ied.buf, ied.pos, -1);
 	if (res < 0)
 		return res;
@@ -2346,29 +2396,45 @@ static int match(struct sockaddr_in *sin, short callno, short dcallno, struct ia
  */
 static int forward_match(struct sockaddr_in *sin, short callno, short dcallno, struct iax_session *cur)
 {
+	// For transfer checks, use exact port matching
 	if ((cur->transfer.sin_addr.s_addr == sin->sin_addr.s_addr) &&
 		(cur->transfer.sin_port == sin->sin_port) && (cur->transferring)) {
 		/* We're transferring */
 		if (dcallno == cur->callno)
 		{
+			IAX_LOG("forward_match: Found transfer match for callno=%d, dcallno=%d", callno, dcallno);
 			return 1;
 		}
 	}
 
-	if ((cur->peeraddr.sin_addr.s_addr == sin->sin_addr.s_addr) &&
-		(cur->peeraddr.sin_port == sin->sin_port)) {
+	// For normal matches, compare only IP addresses and check if we have a custom port
+	if (cur->peeraddr.sin_addr.s_addr == sin->sin_addr.s_addr) {
+		// If we have an explicit peerport set, only accept packets on that port
+		if (cur->peerport > 0) {
+			if (ntohs(sin->sin_port) != cur->peerport) {
+				IAX_LOG("forward_match: Ignoring packet from %s:%d - expecting port %d", 
+					inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), cur->peerport);
+				return 0;
+			}
+		} 
+		// Otherwise do standard port checking
+		else if (cur->peeraddr.sin_port != sin->sin_port) {
+			IAX_LOG("forward_match: Ignoring packet from %s:%d - wrong port, expected %d", 
+				inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), ntohs(cur->peeraddr.sin_port));
+			return 0;
+		}
+		
 		if (dcallno == cur->callno && dcallno != 0)  {
-			/* That's us.  Be sure we keep track of the peer call number */
+			/* That's us. Be sure we keep track of the peer call number */
 			if (cur->peercallno == 0) {
 				cur->peercallno = callno;
+				IAX_LOG("forward_match: Found match and set peercallno=%d for session", callno);
 			}
-			else if ( cur->peercallno != callno )
-			{
+			else if (cur->peercallno != callno) {
 				// print a warning when the callno's don't match
-				fprintf( stderr, "WARNING: peercallno does not match callno"
-					", peercallno => %d, callno => %d, dcallno => %d",
-					cur->peercallno, callno, dcallno ) ;
-				return 0 ;
+				IAX_LOG("WARNING: peercallno does not match callno, peercallno => %d, callno => %d, dcallno => %d",
+					cur->peercallno, callno, dcallno);
+				return 0;
 			}
 			return 1;
 		}
@@ -2379,16 +2445,35 @@ static int forward_match(struct sockaddr_in *sin, short callno, short dcallno, s
 
 static int reverse_match(struct sockaddr_in *sin, short callno, struct iax_session *cur)
 {
+	// For transfer checks, use exact port matching
 	if ((cur->transfer.sin_addr.s_addr == sin->sin_addr.s_addr) &&
 		(cur->transfer.sin_port == sin->sin_port) && (cur->transferring)) {
 		/* We're transferring */
 		if (callno == cur->peercallno)  {
+			IAX_LOG("reverse_match: Found transfer match for callno=%d", callno);
 			return 1;
 		}
 	}
-	if ((cur->peeraddr.sin_addr.s_addr == sin->sin_addr.s_addr) &&
-		(cur->peeraddr.sin_port == sin->sin_port)) {
+	
+	// For normal matches, compare only IP addresses and check if we have a custom port
+	if (cur->peeraddr.sin_addr.s_addr == sin->sin_addr.s_addr) {
+		// If we have an explicit peerport set, only accept packets on that port
+		if (cur->peerport > 0) {
+			if (ntohs(sin->sin_port) != cur->peerport) {
+				IAX_LOG("reverse_match: Ignoring packet from %s:%d - expecting port %d", 
+					inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), cur->peerport);
+				return 0;
+			}
+		} 
+		// Otherwise do standard port checking
+		else if (cur->peeraddr.sin_port != sin->sin_port) {
+			IAX_LOG("reverse_match: Ignoring packet from %s:%d - wrong port, expected %d", 
+				inet_ntoa(sin->sin_addr), ntohs(sin->sin_port), ntohs(cur->peeraddr.sin_port));
+			return 0;
+		}
+		
 		if (callno == cur->peercallno)  {
+			IAX_LOG("reverse_match: Found match for callno=%d", callno);
 			return 1;
 		}
 	}
