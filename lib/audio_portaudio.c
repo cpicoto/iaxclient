@@ -1211,7 +1211,7 @@ static int pa_openwasapi(struct iaxc_audio_driver *d)
         PORT_LOG("pa_openwasapi: Fixed invalid format, using paInt16");
     }
 
-    // 7) Try to boost thread priority (optional - don't fail if this doesn't work)
+    // 7) Windows MMCSS thread priority optimization
     mmcssHandle = AvSetMmThreadCharacteristicsA("Pro Audio", &taskIndex);
     if (mmcssHandle) {
         AvSetMmThreadPriority(mmcssHandle, AVRT_PRIORITY_HIGH);
@@ -1302,7 +1302,6 @@ static int pa_openwasapi(struct iaxc_audio_driver *d)
                 PORT_LOG("pa_openwasapi: All WASAPI attempts failed: %s (0x%x) - falling back to default PortAudio", 
                         Pa_GetErrorText(err), err);
                 
-                // Release MMCSS priority if set
                 if (mmcssHandle) {
                     AvRevertMmThreadCharacteristics(mmcssHandle);
                 }
@@ -1326,7 +1325,7 @@ static int pa_openwasapi(struct iaxc_audio_driver *d)
     // 11) Log final stream configuration
     const PaStreamInfo* streamInfo = Pa_GetStreamInfo(iStream);
     if (streamInfo) {
-        PORT_LOG("pa_openwasapi: Stream configured with input latency=%.1fms, output latency=%.1fms, sample rate=%.1fHz",
+        PORT_LOG("pa_openwasapi: Windows WASAPI configured - input latency=%.1fms, output latency=%.1fms, sample rate=%.1fHz",
                 streamInfo->inputLatency * 1000.0,
                 streamInfo->outputLatency * 1000.0,
                 streamInfo->sampleRate);
