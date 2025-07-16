@@ -24,4 +24,7 @@ int pa_initialize (struct iaxc_audio_driver *d, int sr);
 	until the device is started */
 int pa_initialize_deferred (struct iaxc_audio_driver *d, int sr);
 
+/* External function to control PortAudio debug output */
+EXPORT void pa_set_debug(int enable);
+
 #endif

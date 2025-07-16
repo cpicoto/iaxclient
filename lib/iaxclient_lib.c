@@ -34,31 +34,35 @@
   
   #define IAX_LOG(fmt, ...)                                                    \
     do {                                                                           \
-      char _buf[512];                                                              \
-      char _time_buf[32];                                                          \
-      SYSTEMTIME _st;                                                              \
-      GetLocalTime(&_st);                                                          \
-      snprintf(_time_buf, sizeof(_time_buf), "%02d:%02d:%02d.%03d",                \
-               _st.wHour, _st.wMinute, _st.wSecond, _st.wMilliseconds);            \
-      _snprintf(_buf, sizeof(_buf), "%s:[iaxclient-debug] " fmt "\n",                 \
-               _time_buf, ##__VA_ARGS__);                                          \
-      OutputDebugStringA(_buf);                                                    \
+      if (iaxc_debug_enabled) {                                                    \
+        char _buf[512];                                                            \
+        char _time_buf[32];                                                        \
+        SYSTEMTIME _st;                                                            \
+        GetLocalTime(&_st);                                                        \
+        snprintf(_time_buf, sizeof(_time_buf), "%02d:%02d:%02d.%03d",              \
+                 _st.wHour, _st.wMinute, _st.wSecond, _st.wMilliseconds);          \
+        _snprintf(_buf, sizeof(_buf), "%s:[iaxclient-debug] " fmt "\n",            \
+                 _time_buf, ##__VA_ARGS__);                                        \
+        OutputDebugStringA(_buf);                                                  \
+      }                                                                            \
     } while(0)
 #else
   #include <time.h>
   #include <sys/time.h>
   #define IAX_LOG(fmt, ...)                                                    \
     do {                                                                           \
-      struct timeval tv;                                                           \
-      struct tm* tm_info;                                                          \
-      char _time_buf[32];                                                          \
-      gettimeofday(&tv, NULL);                                                     \
-      tm_info = localtime(&tv.tv_sec);                                             \
-      strftime(_time_buf, sizeof(_time_buf), "%H:%M:%S", tm_info);                 \
-      char _ms_buf[8];                                                             \
-      snprintf(_ms_buf, sizeof(_ms_buf), ".%03d", (int)(tv.tv_usec / 1000));       \
-      strcat(_time_buf, _ms_buf);                                                  \
-      fprintf(stderr, "[iaxclient-debug %s] " fmt "\n", _time_buf, ##__VA_ARGS__);    \
+      if (iaxc_debug_enabled) {                                                    \
+        struct timeval tv;                                                         \
+        struct tm* tm_info;                                                        \
+        char _time_buf[32];                                                        \
+        gettimeofday(&tv, NULL);                                                   \
+        tm_info = localtime(&tv.tv_sec);                                           \
+        strftime(_time_buf, sizeof(_time_buf), "%H:%M:%S", tm_info);               \
+        char _ms_buf[8];                                                           \
+        snprintf(_ms_buf, sizeof(_ms_buf), ".%03d", (int)(tv.tv_usec / 1000));     \
+        strcat(_time_buf, _ms_buf);                                                \
+        fprintf(stderr, "[iaxclient-debug %s] " fmt "\n", _time_buf, ##__VA_ARGS__); \
+      }                                                                            \
     } while(0)
 #endif
 
@@ -89,6 +93,9 @@
 
 /* global test mode flag */
 int test_mode = 0;
+
+/* Global debug flag for all IAXC debug output */
+int iaxc_debug_enabled = 0;
 
 /* Function prototypes for internal functions */
 static struct iaxc_registration *find_registration_by_hostname(const char *hostname);
@@ -2337,10 +2344,23 @@ EXPORT void iaxc_set_radiono(int r)
 
 void iaxc_debug_iax_set(int enable)
 {
+	// Set global debug flag for all IAXC debug output
+	iaxc_debug_enabled = enable;
+	
+	// Control PortAudio debug output
+	pa_set_debug(enable);
+	
 #ifdef DEBUG_SUPPORT
 	if (enable)
 		iax_enable_debug();
 	else
 		iax_disable_debug();
 #endif
+
+	if (enable) {
+		IAX_LOG("iaxc_debug_iax_set: IAXC debug logging ENABLED for all modules");
+	} else {
+		// This message will only show if debug was previously enabled
+		IAX_LOG("iaxc_debug_iax_set: IAXC debug logging DISABLED for all modules");
+	}
 }

@@ -930,15 +930,18 @@ static int iax_xmit_frame(struct iax_frame *f)
 		memcpy(&send_addr, &(f->session->peeraddr), sizeof(send_addr));
 		if (f->session->peerport > 0) {
 			/* Log before changing port to see what's happening */
-			IAX_LOG("iax_send_raw: Using explicit peer port %d instead of %d", 
+			/*IAX_LOG("iax_send_raw: Using explicit peer port %d instead of %d", 
 				f->session->peerport, ntohs(send_addr.sin_port));
+			*/	
 			send_addr.sin_port = htons((short)f->session->peerport);
 		}
 	}
 	
 	/* Log final destination for debugging */
+	/*
 	IAX_LOG("iax_send_raw: Sending to %s:%d", 
 		inet_ntoa(send_addr.sin_addr), ntohs(send_addr.sin_port));
+		*/
 		
 	res = f->session->sendto(netfd, (const char *) f->data, f->datalen,
 			IAX_SOCKOPTS, (struct sockaddr *)&send_addr,
@@ -2428,7 +2431,7 @@ static int forward_match(struct sockaddr_in *sin, short callno, short dcallno, s
 			/* That's us. Be sure we keep track of the peer call number */
 			if (cur->peercallno == 0) {
 				cur->peercallno = callno;
-				IAX_LOG("forward_match: Found match and set peercallno=%d for session", callno);
+				//IAX_LOG("forward_match: Found match and set peercallno=%d for session", callno);
 			}
 			else if (cur->peercallno != callno) {
 				// print a warning when the callno's don't match
@@ -2450,7 +2453,7 @@ static int reverse_match(struct sockaddr_in *sin, short callno, struct iax_sessi
 		(cur->transfer.sin_port == sin->sin_port) && (cur->transferring)) {
 		/* We're transferring */
 		if (callno == cur->peercallno)  {
-			IAX_LOG("reverse_match: Found transfer match for callno=%d", callno);
+			//IAX_LOG("reverse_match: Found transfer match for callno=%d", callno);
 			return 1;
 		}
 	}
@@ -2473,7 +2476,7 @@ static int reverse_match(struct sockaddr_in *sin, short callno, struct iax_sessi
 		}
 		
 		if (callno == cur->peercallno)  {
-			IAX_LOG("reverse_match: Found match for callno=%d", callno);
+			//IAX_LOG("reverse_match: Found match for callno=%d", callno);
 			return 1;
 		}
 	}
