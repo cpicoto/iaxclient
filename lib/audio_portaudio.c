@@ -149,9 +149,9 @@ static int output_samples_played = 0;
 /* RingBuffer Size; Needs to be Pow(2), 1024 = 512 samples = 64ms */
 #ifndef OUTRBSZ
 # ifdef _WIN32
-#  define OUTRBSZ (32768)  /* Much larger output buffer for Windows stability (128K) */
+#  define OUTRBSZ (16384)  /* Balanced for low latency (64K) - prevents overflows */
 # else
-#  define OUTRBSZ (32768)
+#  define OUTRBSZ (16384)
 # endif
 #endif
 
@@ -160,9 +160,9 @@ static int output_samples_played = 0;
  * but not being drained */
 #ifndef INRBSZ
 # ifdef _WIN32
-#  define INRBSZ  (32768)  /* Larger input buffer for Windows buffering (64K) */
+#  define INRBSZ  (8192)   /* Balanced for low latency (32K) */
 # else
-#  define INRBSZ  (16384)
+#  define INRBSZ  (8192)
 # endif
 #endif
 
@@ -190,9 +190,9 @@ static int output_samples_played = 0;
  * does.  The default is to leave this up to portaudio..
  */
 
-/* 20ms ultra-low latency target for outRing buffer */
+/* 30ms balanced latency target for outRing buffer */
 #ifndef RBOUTTARGET
-# define RBOUTTARGET (20)  /* Ultra-low latency for Allstarlink PTT response */
+# define RBOUTTARGET (30)  /* Balanced low latency while preventing overflows */
 #endif
 
 /* size in bytes of ringbuffer target */
@@ -1239,12 +1239,12 @@ static int pa_openwasapi(struct iaxc_audio_driver *d)
         .streamOption   = eStreamOptionNone
     };
 
-    // 9) Configure conservative stream parameters
+    // 9) Configure balanced low-latency stream parameters
     PaStreamParameters inParams = {
         .device                    = inDev,
         .channelCount              = 1,
         .sampleFormat              = paInt16,  // Force known good format
-        .suggestedLatency          = 0.05,     // Conservative 50ms latency
+        .suggestedLatency          = 0.025,    // Balanced 25ms latency
         .hostApiSpecificStreamInfo = &wasapiInfo
     };
 
@@ -1252,7 +1252,7 @@ static int pa_openwasapi(struct iaxc_audio_driver *d)
         .device                    = outDev,
         .channelCount              = 1,
         .sampleFormat              = paInt16,  // Force known good format
-        .suggestedLatency          = 0.05,     // Conservative 50ms latency
+        .suggestedLatency          = 0.025,    // Balanced 25ms latency
         .hostApiSpecificStreamInfo = &wasapiInfo
     };
 
@@ -1979,12 +1979,12 @@ static int pa_output(struct iaxc_audio_driver *d, void *samples, int nSamples)
         return 0;
     }
 
-    // Check for buffer overflow
+    // Check for buffer overflow - be more lenient with small buffers
     if (outRingLen < nSamples) {
         // This is a buffer overflow situation - we need to handle it gracefully       
 
-        // Strategy 1: If slightly over, drop a fraction of samples to catch up        
-        if (outRingLen > nSamples * 0.75) {
+        // Strategy 1: If moderately over, drop a fraction of samples to catch up        
+        if (outRingLen > nSamples * 0.5) {  // Changed from 0.75 to 0.5 for more tolerance
             // Write what we can, skipping some samples
             int skip_ratio = nSamples / outRingLen + 1;
             SAMPLE* in_samples = (SAMPLE*)samples;
@@ -2000,14 +2000,22 @@ static int pa_output(struct iaxc_audio_driver *d, void *samples, int nSamples)
 
             // Write the downsampled buffer
             int written = PaUtil_WriteRingBuffer(&outRing, temp_buf, out_count);       
+#ifdef VERBOSE
             PORT_LOG("pa_output: Partial overflow, downsampled %d samples to %d",      
                      nSamples, written);
+#endif                     
             return written;
         }
 
-        // Strategy 2: For severe overflow, drop all samples and log
-        PORT_LOG("pa_output: Buffer overflow - dropping %d samples (only %d available)", 
-                nSamples, outRingLen);
+        // Strategy 2: For severe overflow, drop all samples and log less frequently
+        static int overflow_counter = 0;
+        overflow_counter++;
+        
+        // Only log every 10th overflow to reduce spam
+        if (overflow_counter % 10 == 0) {
+            PORT_LOG("pa_output: Buffer overflow - dropping %d samples (only %d available) [%d overflows]", 
+                    nSamples, outRingLen, overflow_counter);
+        }
 
         // Count the total number of dropped samples for diagnostics
         static int total_dropped = 0;
