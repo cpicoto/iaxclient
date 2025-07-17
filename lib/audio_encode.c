@@ -351,9 +351,9 @@ static int input_postprocess(void *audio, int len, int rate)
 		{
 			float loudness;
 #ifdef SPEEX_PREPROCESS_GET_AGC_LOUDNESS
-			speex_preprocess_ctl(st, SPEEX_PREPROCESS_GET_AGC_LOUDNESS, &loudness);
+			speex_preprocess_ctl(*active_st, SPEEX_PREPROCESS_GET_AGC_LOUDNESS, &loudness);
 #else
-			loudness = st->loudness2;
+			loudness = (*active_st)->loudness2;
 #endif
             AUDIO_LOG("input_post_process: loudness=(%4.4f)", loudness);
 			if ( loudness > 8000.0f || loudness < 4000.0f )
