@@ -1135,6 +1135,26 @@ EXPORT void iaxc_set_filters(int filters);
 EXPORT void iaxc_set_speex_settings(int decode_enhance, float quality, int bitrate, int vbr, int abr, int complexity);
 
 /*
+ * Audio quality preset definitions - allow easily switching between different audio profiles
+ */
+#define IAXC_AUDIO_PRESET_STANDARD   0  /*!< Standard balanced settings */
+#define IAXC_AUDIO_PRESET_NOISY      1  /*!< Better for noisy environments */
+#define IAXC_AUDIO_PRESET_QUIET      2  /*!< Better for quiet environments */
+#define IAXC_AUDIO_PRESET_BANDWIDTH  3  /*!< Lower bandwidth usage */
+#define IAXC_AUDIO_PRESET_CUSTOM     99 /*!< Custom user-defined settings */
+
+/*!
+    Sets the audio quality preset for both transmission and reception.
+    \param preset_id The preset to use (one of IAXC_AUDIO_PRESET_* values)
+    
+    This function provides an easy way to switch between different audio profiles
+    optimized for various environments. Each preset configures Speex codec settings,
+    preprocessor parameters, and audio filters to achieve the best results for
+    the target environment.
+*/
+EXPORT void iaxc_set_audio_preset(int preset_id);
+
+/*
  Functions and flags for setting and getting audio callback preferences
   The application can request to receive local/remote, raw/encoded audio
   through the callback mechanism. Please note that changing callback

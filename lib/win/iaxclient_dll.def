@@ -47,6 +47,7 @@ EXPORTS
 	iaxc_set_preferred_source_udp_port
 	iaxc_set_silence_threshold
 	iaxc_set_speex_settings
+	iaxc_set_audio_preset
 	iaxc_shutdown
 	iaxc_start_processing_thread
 	iaxc_stop_processing_thread

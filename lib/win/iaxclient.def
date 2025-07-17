@@ -91,17 +91,19 @@ EXPORTS
     iaxc_set_silence_threshold@8 @90
     iaxc_set_speex_settings = iaxc_set_speex_settings@24 @91
     iaxc_set_speex_settings@24 @92
-    iaxc_shutdown = iaxc_shutdown@0 @93
-    iaxc_shutdown@0 @94
-    iaxc_start_processing_thread = iaxc_start_processing_thread@0 @95
-    iaxc_start_processing_thread@0 @96
-    iaxc_stop_processing_thread = iaxc_stop_processing_thread@0 @97
-    iaxc_stop_processing_thread@0 @98
-    iaxc_stop_sound = iaxc_stop_sound@4 @99
-    iaxc_stop_sound@4 @100
-    iaxc_unquelch = iaxc_unquelch@4 @101
-    iaxc_unquelch@4 @102
-    iaxc_unregister = iaxc_unregister@4 @103
-    iaxc_unregister@4 @104
-    iaxc_version = iaxc_version@4 @105
-    iaxc_version@4 @106
+    iaxc_set_audio_preset = iaxc_set_audio_preset@4 @93
+    iaxc_set_audio_preset@4 @94
+    iaxc_shutdown = iaxc_shutdown@0 @95
+    iaxc_shutdown@0 @96
+    iaxc_start_processing_thread = iaxc_start_processing_thread@0 @97
+    iaxc_start_processing_thread@0 @98
+    iaxc_stop_processing_thread = iaxc_stop_processing_thread@0 @99
+    iaxc_stop_processing_thread@0 @100
+    iaxc_stop_sound = iaxc_stop_sound@4 @101
+    iaxc_stop_sound@4 @102
+    iaxc_unquelch = iaxc_unquelch@4 @103
+    iaxc_unquelch@4 @104
+    iaxc_unregister = iaxc_unregister@4 @105
+    iaxc_unregister@4 @106
+    iaxc_version = iaxc_version@4 @107
+    iaxc_version@4 @108

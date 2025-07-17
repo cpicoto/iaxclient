@@ -110,6 +110,17 @@ static int audio_capture_frame_count = 0;
 static int audio_max_sample = 0;
 static int audio_min_sample = 0;
 
+// Audio level normalization parameters
+static float target_level = 0.7f;         // Target level as fraction of max (about -3dB)
+static float level_smoothing = 0.95f;     // Smoothing factor for level detection
+static float current_level_peak = 0.0f;   // Current detected peak level
+static float gain_smoothing = 0.98f;      // Smoothing factor for gain changes
+static float current_gain = 1.0f;         // Current normalization gain
+
+// Forward declarations for audio normalization functions
+static short soft_clip(float sample);
+static void normalize_audio_buffer(short *buffer, int samples);
+
 float iaxci_silence_threshold = AUDIO_ENCODE_SILENCE_DB;
 
 static float input_level = 0.0f;
@@ -223,23 +234,57 @@ static void calculate_level(short *audio, int len, float *level)
 	*level += ((float)big_sample / 32767.0f - *level) / 5.0f;
 }
 
-// Modified to accept a specific preprocessor state
+// Modified to accept a specific preprocessor state with adaptive settings
 static void set_speex_filters_for_state(SpeexPreprocessState* state)
 {
     if (!state) return;
 
     int i;
+    float f;
+    
+    /* Basic filter settings - always enabled */
     i = 1; /* always make VAD decision */
     speex_preprocess_ctl(state, SPEEX_PREPROCESS_SET_VAD, &i);
+    
+    /* AGC (Automatic Gain Control) */
     i = (iaxci_filters & IAXC_FILTER_AGC) ? 1 : 0;
     speex_preprocess_ctl(state, SPEEX_PREPROCESS_SET_AGC, &i);
+    
+    if (i) {
+        /* AGC settings - adaptive for better voice quality */
+        i = 12000;  /* Increased from 8000 - better target level for voice */
+        speex_preprocess_ctl(state, SPEEX_PREPROCESS_SET_AGC_LEVEL, &i);
+        
+        /* AGC maximum gain (some versions of Speex may not support this) */
+        #ifdef SPEEX_PREPROCESS_SET_AGC_MAX_GAIN
+        i = 25;  /* Maximum gain factor */
+        speex_preprocess_ctl(state, SPEEX_PREPROCESS_SET_AGC_MAX_GAIN, &i);
+        #endif
+    }
+    
+    /* Noise suppression/denoise filter */
     i = (iaxci_filters & IAXC_FILTER_DENOISE) ? 1 : 0;
     speex_preprocess_ctl(state, SPEEX_PREPROCESS_SET_DENOISE, &i);
-
-    i = 35;
+    
+    /* VAD (Voice Activity Detection) settings - improved for better speech detection */
+    i = 30;  /* Lower from 35 - easier to trigger voice detection */
     speex_preprocess_ctl(state, SPEEX_PREPROCESS_SET_PROB_START, &i);
-    i = 20;
+    
+    i = 25;  /* Higher from 20 - hold voice detection longer to avoid cutting off phrases */
     speex_preprocess_ctl(state, SPEEX_PREPROCESS_SET_PROB_CONTINUE, &i);
+    
+    /* Enable dereverb for improved speech clarity in all cases */
+    i = 1;
+    speex_preprocess_ctl(state, SPEEX_PREPROCESS_SET_DEREVERB, &i);
+    
+    /* Dereverb settings - enhanced for better echo removal */
+    f = 0.5f;  /* Increased from 0.4f - more aggressive decay handling */
+    speex_preprocess_ctl(state, SPEEX_PREPROCESS_SET_DEREVERB_DECAY, &f);
+    
+    f = 0.35f;  /* Increased from 0.3f - slightly more reverb reduction */
+    speex_preprocess_ctl(state, SPEEX_PREPROCESS_SET_DEREVERB_LEVEL, &f);
+    
+    AUDIO_LOG("Speex preprocessor configured with optimized voice settings");
 }
 
 static int input_postprocess(void *audio, int len, int rate)
@@ -449,17 +494,112 @@ EXPORT void iaxc_set_speex_settings(int decode_enhance, float quality,
 	speex_settings.abr = abr;
 	speex_settings.complexity = complexity;
 }
+
+// Audio quality preset constants
+#define AUDIO_PRESET_STANDARD 0  // Standard balanced settings
+#define AUDIO_PRESET_NOISY 1     // Better for noisy environments
+#define AUDIO_PRESET_QUIET 2     // Better for quiet environments
+#define AUDIO_PRESET_BANDWIDTH 3 // Lower bandwidth usage
+#define AUDIO_PRESET_CUSTOM 99   // Custom user-defined settings
+
+// Audio quality preset type
+typedef int iaxc_audio_preset;
+
+static iaxc_audio_preset current_audio_preset = AUDIO_PRESET_STANDARD;
+
+// Function to switch between audio quality presets
+EXPORT void iaxc_set_audio_preset(int preset_id)
+{
+    // Store the preset selection
+    current_audio_preset = preset_id;
+    
+    // Apply changes to both codec and preprocessing settings
+    switch (preset_id) {
+        case AUDIO_PRESET_NOISY:
+            // Noisy environment preset - aggressive noise reduction, moderate AGC
+            AUDIO_LOG("Setting audio preset: NOISY ENVIRONMENT");
+            
+            // Speex codec settings
+            speex_settings.decode_enhance = 1;
+            speex_settings.quality = 6.0f;  // Medium quality (range 0-10)
+            speex_settings.complexity = 4;  // Medium complexity for better noise handling
+            
+            // Filters to enable
+            iaxci_filters = IAXC_FILTER_AGC | IAXC_FILTER_DENOISE | IAXC_FILTER_CN;
+            
+            // Set target level for normalization
+            target_level = 0.75f;  // Higher target level for noisy environments
+            break;
+            
+        case AUDIO_PRESET_QUIET:
+            // Quiet environment preset - light noise reduction, gentle AGC
+            AUDIO_LOG("Setting audio preset: QUIET ENVIRONMENT");
+            
+            // Speex codec settings
+            speex_settings.decode_enhance = 1;
+            speex_settings.quality = 8.0f;  // Higher quality (range 0-10)
+            speex_settings.complexity = 5;  // Higher complexity for better quality
+            
+            // Filters to enable
+            iaxci_filters = IAXC_FILTER_AGC | IAXC_FILTER_DENOISE | IAXC_FILTER_AAGC | IAXC_FILTER_CN;
+            
+            // Set target level for normalization
+            target_level = 0.65f;  // Lower target level for quiet environments
+            break;
+            
+        case AUDIO_PRESET_BANDWIDTH:
+            // Low bandwidth preset - lower quality, more compression
+            AUDIO_LOG("Setting audio preset: LOW BANDWIDTH");
+            
+            // Speex codec settings
+            speex_settings.decode_enhance = 1;
+            speex_settings.quality = 4.0f;  // Lower quality (range 0-10)
+            speex_settings.complexity = 2;  // Lower complexity for less CPU usage
+            
+            // Filters to enable - minimal processing
+            iaxci_filters = IAXC_FILTER_DENOISE | IAXC_FILTER_CN;
+            
+            // Set target level for normalization
+            target_level = 0.7f;  // Medium target level
+            break;
+            
+        case AUDIO_PRESET_STANDARD:
+        default:
+            // Standard preset - balanced settings
+            AUDIO_LOG("Setting audio preset: STANDARD");
+            
+            // Speex codec settings
+            speex_settings.decode_enhance = 1;
+            speex_settings.quality = 7.0f;  // Good quality (range 0-10)
+            speex_settings.complexity = 3;  // Standard complexity
+            
+            // Filters to enable
+            iaxci_filters = IAXC_FILTER_AGC | IAXC_FILTER_DENOISE | IAXC_FILTER_AAGC | IAXC_FILTER_CN;
+            
+            // Set target level for normalization
+            target_level = 0.7f;  // Standard target level
+            break;
+    }
+    
+    // Apply the new settings to the preprocessor states
+    set_speex_filters();
+    
+    // Reset gain tracking for level normalization
+    current_gain = 1.0f;
+    current_level_peak = 0.1f;  // Start with a reasonable level
+}
+
 static int ptt_active=-1;
 EXPORT void set_ptt(int val)
 {
     ptt_active = val;
 }
 int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
-        int format, int samples)
+        int format, int sample_count)
 {
     unsigned char outbuf[1024];
     int outsize = 1024;
-    int insize = samples;
+    int insize = sample_count;
     static int was_silent_before = 0;
     
     /* update last input timestamp */
@@ -467,11 +607,11 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
     
     // Only record audio to WAV file - don't process it for silence detection
     if (audio_capture_file) {
-        short *samples_ptr = (short *)data;
+        short *audio_data = (short *)data;
         // Add statistics gathering
         for (int i = 0; i < insize; i++) {
-            if (samples_ptr[i] > audio_max_sample) audio_max_sample = samples_ptr[i];
-            if (samples_ptr[i] < audio_min_sample) audio_min_sample = samples_ptr[i];
+            if (audio_data[i] > audio_max_sample) audio_max_sample = audio_data[i];
+            if (audio_data[i] < audio_min_sample) audio_min_sample = audio_data[i];
         }
         
         // Write raw PCM data to file
@@ -484,16 +624,47 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
         fflush(audio_capture_file);
     }
     
-    // MODIFIED: Only do silence detection if not in PTT mode
+    // Normalize audio levels for consistent transmission volume
+    short *audio_samples = (short *)data;
+    
+    // Apply normalization to adjust levels for optimal clarity
+    normalize_audio_buffer(audio_samples, insize);
+    
+    // Enhanced silence detection logic with voice onset detection
     int silent = 0;
+    
+    // Skip silence detection completely in PTT mode
     if(ptt_active>=0) {
 #ifdef VERBOSE
         AUDIO_LOG("audio_send_encoded_audio:PTT active: BYPASSING SILENCE DETECTION");
 #endif
     }
     else {
-        // Only do normal silence detection when PTT is not active
+        // First, analyze initial portion for voice onset detection
+        int max_sample = 0;
+        int transient_count = 0;
+        int prev_sample = 0;
+        
+        // Scan for voice onset markers (sharp transients, consistent level)
+        for (int i = 0; i < (insize < 30 ? insize : 30); i++) {
+            int abs_val = abs(audio_samples[i]);
+            if (abs_val > max_sample) max_sample = abs_val;
+            
+            // Count significant transients (typical of voice onset)
+            if (abs(audio_samples[i] - prev_sample) > 300) {
+                transient_count++;
+            }
+            prev_sample = audio_samples[i];
+        }
+        
+        // Standard silence detection with preprocessing
         silent = input_postprocess(data, insize, 8000);
+        
+        // Override for definite voice onset detected
+        if (silent && ((max_sample > 2000) || (transient_count >= 3))) {
+            AUDIO_LOG("audio_send_encoded_audio:Voice onset detected, overriding VAD decision");
+            silent = 0;  // Override silence detection on voice onset
+        }
     }
 
     // Continue with regular IAX silence handling
@@ -566,7 +737,7 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
 
     // Always send voice data regardless of callback preferences
     if(iax_send_voice(call->session, format, outbuf,
-                sizeof(outbuf) - outsize, samples-insize) == -1)
+                sizeof(outbuf) - outsize, sample_count) == -1)
     {
         fprintf(stderr, "Failed to send voice! %s\n", iax_errstr);
         AUDIO_LOG("audio_send_encoded_audio:Failed to send voice! %s\n", iax_errstr);
@@ -934,5 +1105,58 @@ EXPORT void iaxc_ptt_filters_restore(void) {
     // Restore previous filters
     iaxc_set_filters(saved_filters);
     AUDIO_LOG("iaxc_ptt_filters_restore:PTT: Restored audio filters to previous settings");
+}
+
+// Apply soft-clipping to prevent harsh digital clipping
+static short soft_clip(float sample) {
+    // Soft clipper with smooth transition
+    if (sample > 32000.0f) {
+        // Soft knee compression above 32000
+        float excess = sample - 32000.0f;
+        sample = 32000.0f + (1.0f - expf(-0.1f * excess / 768.0f)) * 768.0f;
+    } else if (sample < -32000.0f) {
+        // Soft knee compression below -32000
+        float excess = -sample - 32000.0f;
+        sample = -32000.0f - (1.0f - expf(-0.1f * excess / 768.0f)) * 768.0f;
+    }
+    
+    // Hard limit at int16 boundaries to be safe
+    if (sample > 32767.0f) sample = 32767.0f;
+    if (sample < -32768.0f) sample = -32768.0f;
+    
+    return (short)sample;
+}
+
+// Apply normalization to a buffer of audio samples
+static void normalize_audio_buffer(short *buffer, int samples) {
+    float max_level = 0.0f;
+    
+    // Find peak level in this buffer
+    for (int i = 0; i < samples; i++) {
+        float abs_sample = fabsf((float)buffer[i] / 32768.0f);
+        if (abs_sample > max_level) max_level = abs_sample;
+    }
+    
+    // Update smoothed level detector
+    current_level_peak = level_smoothing * current_level_peak + 
+                        (1.0f - level_smoothing) * max_level;
+    
+    // Calculate target gain if signal is present
+    if (current_level_peak > 0.01f) { // Only adjust gain when signal is present
+        float target_gain = target_level / current_level_peak;
+        
+        // Limit maximum gain to prevent noise amplification
+        if (target_gain > 4.0f) target_gain = 4.0f;
+        
+        // Smooth gain changes to prevent artifacts
+        current_gain = gain_smoothing * current_gain + 
+                      (1.0f - gain_smoothing) * target_gain;
+    }
+    
+    // Apply gain and soft clipping to each sample
+    for (int i = 0; i < samples; i++) {
+        float processed = (float)buffer[i] * current_gain;
+        buffer[i] = soft_clip(processed);
+    }
 }
 
