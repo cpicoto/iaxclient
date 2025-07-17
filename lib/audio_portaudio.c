@@ -2323,10 +2323,15 @@ static int _pa_initialize (struct iaxc_audio_driver *d, int sr)
 	PaUtil_FlushRingBuffer(&inRing);
 	PaUtil_FlushRingBuffer(&outRing);
 
-	// Add some silence at the beginning to prime the output buffer
-	// This helps prevent initial audio underruns
-	SAMPLE silence[512] = {0};  // Larger silence buffer for stability
-	PaUtil_WriteRingBuffer(&outRing, silence, 512);
+	// Add sufficient silence at the beginning to prime the output buffer
+	// This prevents initial audio underruns and dropping of first audio packets
+	SAMPLE silence[2048] = {0};  // Much larger silence buffer to prevent initial audio drops
+	// Fill approximately 250ms of silence to ensure we don't lose initial audio
+	for (int i = 0; i < 8; i++) {  // Add multiple chunks to avoid a single large allocation
+	    PaUtil_WriteRingBuffer(&outRing, silence, 2048);
+	}
+	PORT_LOG("_pa_initialize: Added %.1f ms of initial silence to output buffer to prevent dropping initial audio", 
+	         (2048 * 8 * 1000.0) / sample_rate);
 	
 	PORT_LOG("_pa_initialize: Ring buffers initialized with %d bytes input and %d bytes output",
 		INRBSZ * sizeof(SAMPLE), OUTRBSZ * sizeof(SAMPLE));

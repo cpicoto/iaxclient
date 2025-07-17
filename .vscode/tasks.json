@@ -5,7 +5,7 @@
     "args": [
         "--login",
         "-c",
-        "cd /home/cpico/iaxclient/lib/build && rm -rf CMakeCache.txt CMakeFiles && cmake -G \"MinGW Makefiles\" -DCMAKE_BUILD_TYPE=Debug -DENABLE_SPEEX=ON -DCMAKE_C_FLAGS=\"-g -O0\" .. && mingw32-make"
+        "cd /home/cpico/iaxclient/lib/build && rm -rf CMakeCache.txt CMakeFiles && cmake -G \"MinGW Makefiles\" -DCMAKE_BUILD_TYPE=Debug -DENABLE_SPEEX=ON -DCMAKE_C_FLAGS=\"-g -O0\" .. && mingw32-make -j4"
     ],
     "group": {
         "kind": "build",
