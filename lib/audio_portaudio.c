@@ -160,9 +160,9 @@ static int output_samples_played = 0;
  * but not being drained */
 #ifndef INRBSZ
 # ifdef _WIN32
-#  define INRBSZ  (8192)   /* Balanced for low latency (32K) */
+#  define INRBSZ  (16384)   /* Increased for stability (64K) */
 # else
-#  define INRBSZ  (8192)
+#  define INRBSZ  (16384)
 # endif
 #endif
 
@@ -190,9 +190,9 @@ static int output_samples_played = 0;
  * does.  The default is to leave this up to portaudio..
  */
 
-/* 30ms balanced latency target for outRing buffer */
+/* 50ms balanced latency target for outRing buffer */
 #ifndef RBOUTTARGET
-# define RBOUTTARGET (30)  /* Balanced low latency while preventing overflows */
+# define RBOUTTARGET (50)  /* Increased for stability while maintaining good latency */
 #endif
 
 /* size in bytes of ringbuffer target */
