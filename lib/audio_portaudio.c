@@ -255,7 +255,9 @@ static int scan_devices(struct iaxc_audio_driver *d)
 	int nDevices;
 	int i;
 
+	PORT_LOG("scan_devices: Starting device scan...");
 	d->nDevices = nDevices = Pa_GetDeviceCount();
+	PORT_LOG("scan_devices: Found %d total devices", nDevices);
 	d->devices = (struct iaxc_audio_device *)
 		malloc(nDevices * sizeof(struct iaxc_audio_device));
 
@@ -274,33 +276,37 @@ static int scan_devices(struct iaxc_audio_driver *d)
 			dev->capabilities = 0;
 
 			if ( pa->maxInputChannels > 0 ){
-				dev->capabilities |= IAXC_AD_INPUT;
-#ifdef VERBOSE                
-				PORT_LOG("scan_devices:IAXC_AD_INPUT: %s", dev->name);
-#endif                
+				// Check if this is a loopback device and skip it for input
+				if (strstr(dev->name, "[Loopback]") != NULL) {
+					PORT_LOG("scan_devices:SKIPPING_LOOPBACK_INPUT: %s", dev->name);
+				} else {
+					dev->capabilities |= IAXC_AD_INPUT;
+					PORT_LOG("scan_devices:IAXC_AD_INPUT: %s", dev->name);
+				}
 			}
 
 			if ( pa->maxOutputChannels > 0 )
 			{
 				dev->capabilities |= IAXC_AD_OUTPUT;
-				dev->capabilities |= IAXC_AD_RING;
-#ifdef VERBOSE                                
+				dev->capabilities |= IAXC_AD_RING;                              
 				PORT_LOG("scan_devices:IAXC_AD_OUTPUT: %s", dev->name);
-#endif                
+            
 			}
 
-			if ( i == Pa_GetDefaultInputDevice() ){	
-#ifdef VERBOSE                                
-				PORT_LOG("scan_devices:IAXC_AD_INPUT_DEFAULT: %s", dev->name);
-#endif                
+			if ( i == Pa_GetDefaultInputDevice() ){
+				// Only set default input flag if this device has input capabilities (not filtered out as loopback)
+				if (dev->capabilities & IAXC_AD_INPUT) {
+					dev->capabilities |= IAXC_AD_INPUT_DEFAULT;                             
+					PORT_LOG("scan_devices:IAXC_AD_INPUT_DEFAULT: %s", dev->name);
+				} else {
+					PORT_LOG("scan_devices:SKIPPING_LOOPBACK_DEFAULT_INPUT: %s", dev->name);
+				}
 			}
 			if ( i == Pa_GetDefaultOutputDevice() )
 			{
 				dev->capabilities |= IAXC_AD_OUTPUT_DEFAULT;
-				dev->capabilities |= IAXC_AD_RING_DEFAULT;
-#ifdef VERBOSE                                
+				dev->capabilities |= IAXC_AD_RING_DEFAULT;                          
 				PORT_LOG("scan_devices:IAXC_AD_OUTPUT_DEFAULT: %s", dev->name);
-#endif
 			}
 		}
 		else //frik: under Terminal Services
@@ -311,6 +317,7 @@ static int scan_devices(struct iaxc_audio_driver *d)
 		}
 	}
 
+	PORT_LOG("scan_devices: Completed scanning %d devices", nDevices);
 	return 0;
 }
 
@@ -2247,9 +2254,8 @@ static int _pa_initialize (struct iaxc_audio_driver *d, int sr)
 	PaError  err;
 
 	sample_rate = sr;
-#ifdef VERBOSE
+
     PORT_LOG("_pa_initialize:Initializing PortAudio with sample rate %d", sr);
-#endif
 	/* initialize portaudio */
 	if ( paNoError != (err = Pa_Initialize()) )
 	{
@@ -2274,15 +2280,14 @@ static int _pa_initialize (struct iaxc_audio_driver *d, int sr)
 		}
 	}
 	
-#ifdef VERBOSE
-    PORT_LOG("_pa_initialize:Pa_Initialize succeeded, scanning devices");
-#endif
-	scan_devices(d);
-#ifdef VERBOSE
-	PORT_LOG("_pa_initialize:Found %d audio devices", d->nDevices);
-#endif
 
-	/* setup methods */
+    PORT_LOG("_pa_initialize:Pa_Initialize succeeded, scanning devices");
+
+	scan_devices(d);
+
+	PORT_LOG("_pa_initialize:Found %d audio devices", d->nDevices);
+
+/* setup methods */
 	d->initialize = pa_initialize;
 	d->destroy = pa_destroy;
 	d->select_devices = pa_select_devices;
