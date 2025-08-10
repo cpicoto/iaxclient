@@ -58,9 +58,12 @@
         GetLocalTime(&_st);                                                        \
         snprintf(_time_buf, sizeof(_time_buf), "%02d:%02d:%02d.%03d",              \
                  _st.wHour, _st.wMinute, _st.wSecond, _st.wMilliseconds);          \
-        _snprintf(_buf, sizeof(_buf), "%s:[portaudio-debug] " fmt "\n",            \
+        _snprintf(_buf, sizeof(_buf), "%s:[portaudio-debug] " fmt,                 \
                  _time_buf, ##__VA_ARGS__);                                        \
         OutputDebugStringA(_buf);                                                  \
+        if (pa_debug_callback) {                                                   \
+          pa_debug_callback(_buf);                                                 \
+        }                                                                          \
       }                                                                            \
     } while(0)
 #else
@@ -72,13 +75,18 @@
         struct timeval tv;                                                         \
         struct tm* tm_info;                                                        \
         char _time_buf[32];                                                        \
+        char _buf[512];                                                            \
         gettimeofday(&tv, NULL);                                                   \
         tm_info = localtime(&tv.tv_sec);                                           \
         strftime(_time_buf, sizeof(_time_buf), "%H:%M:%S", tm_info);               \
         char _ms_buf[8];                                                           \
         snprintf(_ms_buf, sizeof(_ms_buf), ".%03d", (int)(tv.tv_usec / 1000));     \
         strcat(_time_buf, _ms_buf);                                                \
-        fprintf(stderr, "[portaudio-debug %s] " fmt "\n", _time_buf, ##__VA_ARGS__); \
+        snprintf(_buf, sizeof(_buf), "[portaudio-debug %s] " fmt, _time_buf, ##__VA_ARGS__); \
+        fprintf(stderr, "%s\n", _buf);                                             \
+        if (pa_debug_callback) {                                                   \
+          pa_debug_callback(_buf);                                                 \
+        }                                                                          \
       }                                                                            \
     } while(0)
 #endif
@@ -123,6 +131,10 @@ static int startup_counter = 0;  // Add this line
 
 static int current_audio_format = 0;  // Add this to track audio format
 static int portaudio_debug_enabled = 0;  // Global debug flag for PortAudio - disabled by default
+
+// Callback function pointer for debug messages to C# application
+typedef void (*pa_debug_callback_t)(const char* message);
+static pa_debug_callback_t pa_debug_callback = NULL;
 static int pa_openwasapi(struct iaxc_audio_driver *d); //AD7NP move to wasapi
 /* actual WASAPI host rate and ratio for resampling */
 static double host_sample_rate = 0.0;  /* card’s native rate, e.g. 48000.0 */
@@ -290,6 +302,7 @@ static int scan_devices(struct iaxc_audio_driver *d)
 			}
 
 			if ( i == Pa_GetDefaultInputDevice() ){	
+				dev->capabilities |= IAXC_AD_INPUT_DEFAULT;
 #ifdef VERBOSE                                
 				PORT_LOG("scan_devices:IAXC_AD_INPUT_DEFAULT: %s", dev->name);
 #endif                
@@ -878,21 +891,62 @@ static int pa_open(int single, int inMono, int outMono)
     PORT_LOG("pa_open: single=%d, inMono=%d, outMono=%d", single, inMono, outMono);
     PORT_LOG("pa_open: selectedInput=%d, selectedOutput=%d", selectedInput, selectedOutput);
 
+	// Validate device IDs before proceeding
+	int deviceCount = Pa_GetDeviceCount();
+	PORT_LOG("pa_open: Device count: %d", deviceCount);
+	
+	if (selectedInput < 0 || selectedInput >= deviceCount) {
+		PORT_LOG("pa_open: Invalid input device ID %d (valid range: 0-%d)", selectedInput, deviceCount-1);
+		PORT_LOG("pa_open: This may be caused by Voicemeeter not running or device IDs changing");
+		return -1;
+	}
+	if (selectedOutput < 0 || selectedOutput >= deviceCount) {
+		PORT_LOG("pa_open: Invalid output device ID %d (valid range: 0-%d)", selectedOutput, deviceCount-1);
+		PORT_LOG("pa_open: This may be caused by Voicemeeter not running or device IDs changing");
+		return -1;
+	}
+
 	struct PaStreamParameters in_stream_params, out_stream_params, no_device;
 	in_stream_params.device = selectedInput;
 	in_stream_params.channelCount = (inMono ? 1 : 2);
 	in_stream_params.sampleFormat = paInt16;
     PORT_LOG("pa_open:Input stream format explicitly set to 0x%x (paInt16)", paInt16);
-	result = (PaDeviceInfo *)Pa_GetDeviceInfo(selectedInput);
-	if ( result == NULL ) return -1;
+	
+	// Retry logic for device info retrieval (helps with release build timing)
+	result = NULL;
+	for (int retry = 0; retry < 3 && result == NULL; retry++) {
+		result = (PaDeviceInfo *)Pa_GetDeviceInfo(selectedInput);
+		if (result == NULL) {
+			PORT_LOG("pa_open: Input device info not available on attempt %d, retrying...", retry + 1);
+			iaxc_millisleep(10); // Small delay between retries
+		}
+	}
+	if ( result == NULL ) {
+		PORT_LOG("pa_open: Failed to get input device info for device %d after retries", selectedInput);
+		return -1;
+	}
+	PORT_LOG("pa_open: Input device: %s", result->name);
 	in_stream_params.suggestedLatency = result->defaultLowInputLatency;
 	in_stream_params.hostApiSpecificStreamInfo = NULL;
 
 	out_stream_params.device = selectedOutput;
 	out_stream_params.channelCount = (outMono ? 1 : 2);
 	out_stream_params.sampleFormat = paInt16;
-	result = (PaDeviceInfo *)Pa_GetDeviceInfo(selectedOutput);
-	if ( result == NULL ) return -1;
+	
+	// Retry logic for output device info retrieval 
+	result = NULL;
+	for (int retry = 0; retry < 3 && result == NULL; retry++) {
+		result = (PaDeviceInfo *)Pa_GetDeviceInfo(selectedOutput);
+		if (result == NULL) {
+			PORT_LOG("pa_open: Output device info not available on attempt %d, retrying...", retry + 1);
+			iaxc_millisleep(10); // Small delay between retries
+		}
+	}
+	if ( result == NULL ) {
+		PORT_LOG("pa_open: Failed to get output device info for device %d after retries", selectedOutput);
+		return -1;
+	}
+	PORT_LOG("pa_open: Output device: %s", result->name);
 	out_stream_params.suggestedLatency = result->defaultLowOutputLatency;
 	out_stream_params.hostApiSpecificStreamInfo = NULL;
 
@@ -2092,6 +2146,41 @@ static void pa_boost_buffer(void)
 static int pa_select_devices(struct iaxc_audio_driver *d, int input,
 		int output, int ring)
 {
+	// Validate device IDs before selecting them
+	int deviceCount = Pa_GetDeviceCount();
+	
+	if (input < 0 || input >= deviceCount) {
+		PORT_LOG("pa_select_devices: Invalid input device ID %d (valid range: 0-%d)", input, deviceCount-1);
+		return -1;
+	}
+	
+	if (output < 0 || output >= deviceCount) {
+		PORT_LOG("pa_select_devices: Invalid output device ID %d (valid range: 0-%d)", output, deviceCount-1);
+		return -1;
+	}
+	
+	if (ring < 0 || ring >= deviceCount) {
+		PORT_LOG("pa_select_devices: Invalid ring device ID %d (valid range: 0-%d)", ring, deviceCount-1);
+		return -1;
+	}
+	
+	// Verify devices are actually available
+	const PaDeviceInfo* inputInfo = Pa_GetDeviceInfo(input);
+	const PaDeviceInfo* outputInfo = Pa_GetDeviceInfo(output);
+	
+	if (!inputInfo) {
+		PORT_LOG("pa_select_devices: Input device %d is not available", input);
+		return -1;
+	}
+	
+	if (!outputInfo) {
+		PORT_LOG("pa_select_devices: Output device %d is not available", output);
+		return -1;
+	}
+	
+	PORT_LOG("pa_select_devices: Setting devices - Input: %d (%s), Output: %d (%s), Ring: %d", 
+			input, inputInfo->name, output, outputInfo->name, ring);
+
 	selectedInput = input;
 	selectedOutput = output;
 	selectedRing = ring;
@@ -2303,6 +2392,37 @@ static int _pa_initialize (struct iaxc_audio_driver *d, int sr)
 	selectedInput  = Pa_GetDefaultInputDevice();
 	selectedOutput = Pa_GetDefaultOutputDevice();
 	selectedRing   = Pa_GetDefaultOutputDevice();
+	
+	// Handle case where no default devices are available
+	if (selectedInput == paNoDevice) {
+		// Find first available input device
+		int deviceCount = Pa_GetDeviceCount();
+		for (int i = 0; i < deviceCount; i++) {
+			const PaDeviceInfo *info = Pa_GetDeviceInfo(i);
+			if (info && info->maxInputChannels > 0) {
+				selectedInput = i;
+				PORT_LOG("_pa_initialize: No default input device, using first available: %s (ID=%d)", info->name, i);
+				break;
+			}
+		}
+	}
+	
+	if (selectedOutput == paNoDevice) {
+		// Find first available output device
+		int deviceCount = Pa_GetDeviceCount();
+		for (int i = 0; i < deviceCount; i++) {
+			const PaDeviceInfo *info = Pa_GetDeviceInfo(i);
+			if (info && info->maxOutputChannels > 0) {
+				selectedOutput = i;
+				selectedRing = i;  // Ring device same as output
+				PORT_LOG("_pa_initialize: No default output device, using first available: %s (ID=%d)", info->name, i);
+				break;
+			}
+		}
+	}
+	
+	PORT_LOG("_pa_initialize: Selected devices - Input: %d, Output: %d, Ring: %d", 
+			selectedInput, selectedOutput, selectedRing);
 	sounds = NULL;
 	MUTEXINIT(&sound_lock);
 
@@ -2630,5 +2750,14 @@ EXPORT void pa_set_debug(int enable)
     } else if (!enable && portaudio_debug_enabled) {
         portaudio_debug_enabled = 0;
         PORT_LOG("pa_set_debug: PortAudio debug logging DISABLED");
+    }
+}
+
+/* External function to set debug message callback for C# integration */
+EXPORT void pa_set_debug_callback(pa_debug_callback_t callback)
+{
+    pa_debug_callback = callback;
+    if (callback && portaudio_debug_enabled) {
+        PORT_LOG("pa_set_debug_callback: Debug callback registered for C# integration");
     }
 }

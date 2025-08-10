@@ -27,4 +27,8 @@ int pa_initialize_deferred (struct iaxc_audio_driver *d, int sr);
 /* External function to control PortAudio debug output */
 EXPORT void pa_set_debug(int enable);
 
+/* External function to set debug message callback for C# integration */
+typedef void (*pa_debug_callback_t)(const char* message);
+EXPORT void pa_set_debug_callback(pa_debug_callback_t callback);
+
 #endif

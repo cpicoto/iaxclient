@@ -662,7 +662,7 @@ int audio_send_encoded_audio(struct iaxc_call *call, int callNo, void *data,
         
         // Override for definite voice onset detected
         if (silent && ((max_sample > 2000) || (transient_count >= 3))) {
-            AUDIO_LOG("audio_send_encoded_audio:Voice onset detected, overriding VAD decision");
+            //AUDIO_LOG("audio_send_encoded_audio:Voice onset detected, overriding VAD decision");
             silent = 0;  // Override silence detection on voice onset
         }
     }

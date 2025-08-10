@@ -41,9 +41,12 @@
         GetLocalTime(&_st);                                                        \
         snprintf(_time_buf, sizeof(_time_buf), "%02d:%02d:%02d.%03d",              \
                  _st.wHour, _st.wMinute, _st.wSecond, _st.wMilliseconds);          \
-        _snprintf(_buf, sizeof(_buf), "%s:[iaxclient-debug] " fmt "\n",            \
+        _snprintf(_buf, sizeof(_buf), "%s:[iaxclient-debug] " fmt,                 \
                  _time_buf, ##__VA_ARGS__);                                        \
         OutputDebugStringA(_buf);                                                  \
+        if (iaxc_debug_callback) {                                                 \
+          iaxc_debug_callback(_buf);                                               \
+        }                                                                          \
       }                                                                            \
     } while(0)
 #else
@@ -55,13 +58,18 @@
         struct timeval tv;                                                         \
         struct tm* tm_info;                                                        \
         char _time_buf[32];                                                        \
+        char _buf[512];                                                            \
         gettimeofday(&tv, NULL);                                                   \
         tm_info = localtime(&tv.tv_sec);                                           \
         strftime(_time_buf, sizeof(_time_buf), "%H:%M:%S", tm_info);               \
         char _ms_buf[8];                                                           \
         snprintf(_ms_buf, sizeof(_ms_buf), ".%03d", (int)(tv.tv_usec / 1000));     \
         strcat(_time_buf, _ms_buf);                                                \
-        fprintf(stderr, "[iaxclient-debug %s] " fmt "\n", _time_buf, ##__VA_ARGS__); \
+        snprintf(_buf, sizeof(_buf), "[iaxclient-debug %s] " fmt, _time_buf, ##__VA_ARGS__); \
+        fprintf(stderr, "%s\n", _buf);                                             \
+        if (iaxc_debug_callback) {                                                 \
+          iaxc_debug_callback(_buf);                                               \
+        }                                                                          \
       }                                                                            \
     } while(0)
 #endif
@@ -96,6 +104,10 @@ int test_mode = 0;
 
 /* Global debug flag for all IAXC debug output */
 int iaxc_debug_enabled = 0;
+
+/* Global debug callback for C# integration */
+typedef void (*iaxc_debug_callback_t)(const char* message);
+static iaxc_debug_callback_t iaxc_debug_callback = NULL;
 
 /* Function prototypes for internal functions */
 static struct iaxc_registration *find_registration_by_hostname(const char *hostname);
@@ -325,6 +337,7 @@ void iaxci_usermsg(int type, const char *fmt, ...)
 {
 	va_list args;
 	iaxc_event e;
+	char debug_msg[IAXC_EVENT_BUFSIZ];
 
 	e.type = IAXC_EVENT_TEXT;
 	e.ev.text.type = type;
@@ -332,6 +345,19 @@ void iaxci_usermsg(int type, const char *fmt, ...)
 	va_start(args, fmt);
 	vsnprintf(e.ev.text.message, IAXC_EVENT_BUFSIZ, fmt, args);
 	va_end(args);
+
+	// Also send user messages to debug callback for immediate visibility
+	if (iaxc_debug_callback) {
+		const char* type_str = "UNKNOWN";
+		switch(type) {
+			case IAXC_TEXT_TYPE_ERROR: type_str = "ERROR"; break;
+			case IAXC_TEXT_TYPE_FATALERROR: type_str = "FATAL"; break;
+			case IAXC_TEXT_TYPE_NOTICE: type_str = "NOTICE"; break;
+			case IAXC_TEXT_TYPE_STATUS: type_str = "STATUS"; break;
+		}
+		snprintf(debug_msg, sizeof(debug_msg), "[iaxclient-usermsg %s] %s", type_str, e.ev.text.message);
+		iaxc_debug_callback(debug_msg);
+	}
 
 	iaxci_post_event(e);
 }
@@ -2362,5 +2388,17 @@ void iaxc_debug_iax_set(int enable)
 	} else {
 		// This message will only show if debug was previously enabled
 		IAX_LOG("iaxc_debug_iax_set: IAXC debug logging DISABLED for all modules");
+	}
+}
+
+EXPORT void iaxc_set_debug_callback(iaxc_debug_callback_t callback)
+{
+	iaxc_debug_callback = callback;
+	
+	// Also set the PortAudio debug callback to the same callback
+	pa_set_debug_callback((pa_debug_callback_t)callback);
+	
+	if (callback && iaxc_debug_enabled) {
+		IAX_LOG("iaxc_set_debug_callback: Debug callback registered for C# integration");
 	}
 }

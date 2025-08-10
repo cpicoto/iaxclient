@@ -1430,6 +1430,13 @@ EXPORT int iaxc_push_video(void *data, unsigned int size, int fragment);
 EXPORT void iaxc_debug_iax_set(int enable);
 
 /*!
+	Sets a callback function to receive all IAXC debug messages for C# integration.
+	\param callback Function pointer to receive debug messages, or NULL to disable
+*/
+typedef void (*iaxc_debug_callback_t)(const char* message);
+EXPORT void iaxc_set_debug_callback(iaxc_debug_callback_t callback);
+
+/*!
     Sets radioNo
     \param radioNo The number of the radio
 */

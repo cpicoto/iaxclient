@@ -1874,18 +1874,18 @@ int iax_register(struct iax_session *session, const char *server, const char *pe
     memcpy(&session->peeraddr.sin_addr, &sa.sin_addr, sizeof(session->peeraddr.sin_addr));
     session->peeraddr.sin_port = htons(portno);
     session->peeraddr.sin_family = AF_INET;
-    
+#if DEBUG    
     /* Add debug log for network connection details */
     IAX_LOG("iax_register: Connecting to %s:%d (original server='%s')", 
         inet_ntoa(session->peeraddr.sin_addr), portno, server);
-    
+#endif    
     /* Store the port number explicitly for all future communication */
     session->peerport = portno;
     
     /* Make sure the socket address has the same port */
     session->peeraddr.sin_port = htons(portno);
     
-    IAX_LOG("iax_register: Set explicit peer port to %d for all future communications", portno);
+    //IAX_LOG("iax_register: Set explicit peer port to %d for all future communications", portno);
     
     strncpy(session->username, peer, sizeof(session->username) - 1);
     session->refresh = refresh;
@@ -2341,7 +2341,7 @@ int iax_call(struct iax_session *session, const char *cidnum, const char *cidnam
 	/* Make sure the socket address has the same port */
 	session->peeraddr.sin_port = htons(portno);
 	
-	IAX_LOG("iax_call: Set explicit peer port to %d for all future communications", portno);
+	//IAX_LOG("iax_call: Set explicit peer port to %d for all future communications", portno);
 	
 	res = send_command(session, AST_FRAME_IAX, IAX_COMMAND_NEW, 0, ied.buf, ied.pos, -1);
 	if (res < 0)
